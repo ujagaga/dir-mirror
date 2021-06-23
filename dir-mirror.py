@@ -8,29 +8,17 @@ import inotify.adapters
 import inotify.constants
 import time
 import sqlite3
-from tendo import singleton
 import threading
 import asyncio
 import json
 import websockets
 
-me = singleton.SingleInstance()
+DATABASE = None
 db = None
-DATABASE = os.path.join(os.path.expanduser('~'), ".dir-mirror.db")
 ROOT = "/"
 MODE = None
 PORT = None
 HOST = None
-event_queue = []
-file_db = {}
-
-
-def print_files():
-    print("\n\n")
-    for key in file_db.keys():
-        print(key, file_db[key])
-
-    print("\n\n")
 
 
 def calc_hash(file_path):
@@ -44,16 +32,11 @@ def calc_hash(file_path):
     return file_hash.hexdigest()
 
 
+# Database basic functions
 def db_open():
     global db
 
     db = sqlite3.connect(DATABASE)
-
-
-def db_close():
-    global db
-
-    db.close()
 
 
 def query_db(query, args=(), one=False):
@@ -69,12 +52,179 @@ def exec_db(query):
         db.commit()
 
 
+def init_database():
+    global DATABASE
+    global db
+
+    db_dir = os.path.join(ROOT, '.dir-mirror')
+    if not os.path.isdir(db_dir):
+        os.mkdir(db_dir)
+
+    DATABASE = os.path.join(db_dir, "database.db")
+    if os.path.exists(DATABASE):
+        os.remove(DATABASE)
+
+    # Create an empty database
+    db = sqlite3.connect(DATABASE)
+
+    # Create an event queue table
+    sql = "create table events (id INTEGER PRIMARY KEY AUTOINCREMENT, ev_type TEXT, obj_type TEXT, path TEXT, " \
+          "time INTEGER)"
+    db.execute(sql)
+
+    # Create a file and folder list table
+    sql = "create table files (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT, type TEXT, mtime INTEGER, " \
+          "size INTEGER, hash TEXT, content TEXT)"
+    db.execute(sql)
+
+    # Save changes and close
+    db.commit()
+    db.close()
+
+
+def add_event_to_db(event):
+    """ Adds events to database.
+        event to add in format:
+            {'ev_type': <CREATE or DELETE>, 'obj_type': <file or dir>, 'path': <object path relative to ROOT>}
+    """
+    global db
+
+    db_open()
+
+    try:
+        sql = "INSERT INTO events (ev_type, obj_type, path, time) VALUES ('{}', '{}', '{}', '{}')" \
+              "".format(event['ev_type'], event['obj_type'], event['path'], time.time())
+        db.execute(sql)
+        db.commit()
+    except Exception as e:
+        print("ERROR writing events to db: {}".format(e))
+
+    db.close()
+
+
+def get_events_from_db(from_time):
+    """ Retrieves all events from database that happened after specified timestamp. """
+    global db
+
+    sql = "SELECT * FROM events WHERE time > '{}'".format(from_time)
+    db_open()
+    result = query_db(sql, one=True)
+    db.close()
+
+    return result
+
+
+def delete_events_from_db(from_time):
+    """ Deletes all events from database that happened before specified timestamp. """
+    global db
+
+    sql = "DELETE * FROM events WHERE time < '{}'".format(from_time)
+    db_open()
+    result = query_db(sql, one=True)
+    db.close()
+
+    return result
+
+
+def get_file_from_db(path):
+    global db
+
+    sql = "SELECT * FROM files WHERE path='{}'".format(path)
+    db_open()
+    result = query_db(sql, one=True)
+    db.close()
+
+    return result
+
+
+def update_file_in_db(path, type, mtime, size, hash):
+    """ Adds a new or updates existing file of folder in database and updates its parent content
+
+        path: <path relative to ROOT>,
+        type: <file or dir>,
+        mtime: <modify time>,
+        size: <size in bytes if it is a file>,
+        hash: <file hash if it is a file>,
+    """
+    global db
+
+    db_open()
+
+    try:
+        # Add requested file
+        sql = "SELECT id FROM files WHERE path='{}'".format(path)
+        result = query_db(sql, one=True)
+
+        if result is None:
+            sql = "INSERT INTO files (path, type, mtime, size, hash, content) VALUES " \
+                  "('{}', '{}', '{}', '{}', '{}', '{}')".format(path, type, mtime, size, hash, '[]')
+        else:
+            sql = "UPDATE files SET path='{}', type='{}', mtime='{}', size='{}', hash='{}'" \
+                  "WHERE id='{}'".format(path, type, mtime, size, hash, result['id'])
+
+        db.execute(sql)
+
+        if path != '/':
+            # Find parent dir
+            parent_path = os.path.dirname(path)
+            obj_name = '/' + os.path.basename(path)
+            sql = "SELECT * FROM files WHERE path='{}'".format(parent_path)
+            parent = query_db(sql, one=True)
+            if parent is not None:
+                # Update parent content
+                content = json.loads(parent['content'])
+                if obj_name not in content:
+                    content.append(obj_name)
+                    sql = "UPDATE files SET content='{}' WHERE path='{}'".format(json.dumps(content), parent_path)
+                    db.execute(sql)
+
+        db.commit()
+
+    except Exception as e:
+        print("ERROR writing files to db: {}".format(e))
+
+    db.close()
+
+
+def remove_file_from_db(path):
+    """ Removes a file or folder from database and from it's parent content
+
+        path is a path to the file or folder to remove
+    """
+    global db
+
+    db_open()
+    try:
+        if path != '/':
+            # Find parent dir
+            parent_path = os.path.dirname(path)
+            obj_name = '/' + os.path.basename(path)
+            sql = "SELECT * FROM files WHERE path='{}'".format(parent_path)
+            parent = query_db(sql, one=True)
+            if parent is not None:
+                # Delete file form parent content
+                content = json.loads(parent['content'])
+                content.remove(obj_name)
+                sql = "UPDATE files SET content='{}' WHERE path='{}'".format(json.dumps(content), parent_path)
+                db.execute(sql)
+
+            # Delete the requested entry
+            sql = "DELETE FROM files WHERE path ='{}'".format(path)
+            db.execute(sql)
+            db.commit()
+
+    except Exception as e:
+        print("ERROR removing files from db: {}".format(e))
+
+    db.close()
+
+
 def get_stat(file_path):
     info = None
     try:
-        fhash = None
-        fsize = None
-        mtime = None
+        fhash = ""
+        fsize = ""
+        mtime = ""
 
         if os.path.isdir(file_path):
             ftype = 'dir'
@@ -100,104 +250,61 @@ def get_stat(file_path):
     return info
 
 
-def add_dir_to_db(relative_dir_path):
-    global file_db
+def handle_obj_add(relative_path):
+    full_obj_path = os.path.join(ROOT, relative_path.strip("/"))
+    obj_stat = get_stat(full_obj_path)
 
-    relative_dir_path = "/" + relative_dir_path.strip("/")
-    full_dir_path = os.path.join(ROOT, relative_dir_path.strip("/"))
-    parent_dir = os.path.dirname(relative_dir_path)
-    dir_name = '/' + os.path.basename(relative_dir_path)
+    update_file_in_db(relative_path, obj_stat['type'], obj_stat['mtime'], obj_stat['size'], obj_stat['hash'])
 
-    # Add self to parent
-    if dir_name not in file_db[parent_dir]['content']:
-        file_db[parent_dir]['content'].append(dir_name)
+    if obj_stat['type'] == 'dir':
+        # Add children to self content
+        for root, d_names, f_names in os.walk(full_obj_path):
+            # Add folder to self content
+            relative_root = '/' + root[len(ROOT):].strip('/')
+            root_stat = get_stat(root)
 
-    # Add children to self content
-    for root, d_names, f_names in os.walk(full_dir_path):
-        # Add folder to self content
-        relative_root = '/' + root[len(ROOT):].strip('/')
-        root_stat = get_stat(root)
-        parent_dir = os.path.dirname(relative_root)
-        dir_name = '/' + os.path.basename(relative_root)
+            if root_stat is not None and '.dir-mirror' not in relative_root:
+                update_file_in_db(relative_root, root_stat['type'], root_stat['mtime'], root_stat['size'], root_stat['hash'])
 
-        if root_stat is not None:
-            if dir_name not in file_db[parent_dir]['content']:
-                file_db[parent_dir]['content'].append(dir_name)
+                # Add files
+                for f in f_names:
+                    full_path = os.path.join(root, f)
+                    relative_path = os.path.join(relative_root, f)
+                    file_stat = get_stat(full_path)
 
-            root_content = []
-
-            # Add files
-            for f in f_names:
-                full_path = os.path.join(root, f)
-                relative_path = os.path.join(relative_root, f)
-                file_stat = get_stat(full_path)
-
-                if file_stat is not None:
-                    root_content.append('/' + f)
-                    file_db[relative_path] = file_stat
-
-            root_stat["content"] = root_content
-
-        file_db[relative_root] = root_stat
+                    if file_stat is not None:
+                        update_file_in_db(relative_path, file_stat['type'], file_stat['mtime'], file_stat['size'], file_stat['hash'])
 
 
-def delete_dir_from_db(relative_dir_path):
-    global file_db
+def handle_obj_delete(relative_path):
+    # Get the dir object from db
+    obj = get_file_from_db(relative_path)
 
-    relative_dir_path = "/" + relative_dir_path.strip("/")
-    parent_dir = os.path.dirname(relative_dir_path)
-    dir_name = '/' + os.path.basename(relative_dir_path)
+    if obj['type'] == 'dir':
+        obj_content = json.loads(obj['content'])
 
-    if file_db[relative_dir_path]["type"] != 'dir':
-        print("ERROR: {} is not a directory.".format(relative_dir_path))
-        return
+        # Delete children
+        try:
+            for child_name in obj_content:
+                child_relative_path = os.path.join(relative_path, child_name.strip('/'))
 
-    # Delete children
-    try:
-        for child_name in file_db[relative_dir_path]["content"]:
-            child_relative_path = os.path.join(relative_dir_path, child_name.strip('/'))
-            if file_db[child_relative_path]["type"] == 'dir':
-                delete_dir_from_db(child_relative_path)
-            else:
-                try:
-                    del file_db[child_relative_path]
-                except Exception as ef:
-                    print("ERROR deleting file from parent:\n\t{}".format(ef))
-    except Exception as ed:
-        print("ERROR listing children:\n\t{}".format(ed))
+                # get child
+                child = get_file_from_db(child_relative_path)
 
-    # Delete self from parent
-    try:
-        file_db[parent_dir]['content'].remove(dir_name)
-    except Exception as e:
-        print("ERROR removing {} from database:\n\t{}".format(dir_name, e))
+                if child["type"] == 'dir':
+                    handle_obj_delete(child_relative_path)
+                else:
+                    remove_file_from_db(child_relative_path)
+
+        except Exception as ed:
+            print("ERROR listing children:\n\t{}".format(ed))
 
     # Finally delete self from database
-    del file_db[relative_dir_path]
-
-
-def build_file_list():
-    global file_db
-
-    # Add root dir
-    root_stat = get_stat(ROOT)
-    file_db['/'] = root_stat
-
-    for obj in os.listdir(ROOT):
-        full_path = os.path.join(ROOT, obj)
-        if os.path.isdir(full_path):
-            add_dir_to_db(obj)
-        else:
-            file_stat = get_stat(full_path)
-
-            if file_stat is not None:
-                file_db['/' + obj] = file_stat
-                root_content = file_db['/'].get('content', [])
-                root_content.append('/' + obj)
-                file_db['/']['content'] = root_content
+    remove_file_from_db(relative_path)
 
 
 def check_args():
+    """ Verifies input arguments """
     global args
     global ROOT
     global MODE
@@ -228,58 +335,20 @@ def check_args():
         sys.exit("ERROR: {}, \n\tPlease specify a port higher than 80.".format(e))
 
 
-def handle_event(event_data):
-    global event_queue
-    global file_db
-
-    event_queue.append(event_data)
-
-    if event_data["obj_type"] == 'dir':
-        # Working with a dir
-        if event_data["ev_type"] == "DELETE":
-            delete_dir_from_db(event_data["path"])
-        else:
-            add_dir_to_db(event_data["path"])
-    else:
-        # Working with a file
-        parent_dir = '/' + os.path.dirname(event_data["path"]).strip("/")
-        file_name = '/' + os.path.basename(event_data["path"])
-
-        if event_data["ev_type"] == "DELETE":
-            del file_db[event_data["path"]]
-
-            # delete self from parent dir
-            try:
-                file_db[parent_dir]['content'].remove(file_name)
-            except Exception as e:
-                print("ERROR removing {} form database:\n\t{}".format(file_name, e))
-        else:
-            # Add self to parent
-            full_path = os.path.join(ROOT, event_data["path"])
-            file_stat = get_stat(full_path)
-            file_relative_path = '/' + event_data["path"].strip('/')
-
-            if file_stat is not None:
-                file_db[file_relative_path] = file_stat
-                if file_name not in file_db[parent_dir]['content']:
-                    file_db[parent_dir]['content'].append(file_name)
-
-
 def parse_event(ev_type, ev_path, ev_file_name):
     """ Processes file system change events received from kernel
 
         Calls handle_event function using an event object formatted as a dictionary containing:
         ev_type can be either "CREATED" or "DELETED"
         obj_type can be either "file" or "folder"
-        path is a path relative to the ROOT directory stripped of leading and trailing "/"
+        path is a path relative to the ROOT directory.
     """
-
     global event_queue
 
     obj_event_type = None
     obj_type = 'file'
 
-    if len(ev_file_name) > 0:
+    if len(ev_file_name) > 0 and '.dir-mirror' not in ev_path:
         for event_type in ev_type:
             if 'ISDIR' in event_type:
                 obj_type = 'dir'
@@ -289,15 +358,25 @@ def parse_event(ev_type, ev_path, ev_file_name):
             elif "DELETE" in event_type or "MOVED_FROM" in event_type:
                 obj_event_type = "DELETE"
 
-    full_path = os.path.join(ev_path, ev_file_name)
-    relative_path = full_path[len(ROOT):].strip('/')
+        full_path = os.path.join(ev_path, ev_file_name)
+        relative_path = '/' + full_path[len(ROOT):].strip('/')
 
-    if obj_event_type is not None:
-        event_data = {"ev_type": obj_event_type, "obj_type": obj_type, "path": relative_path, "time": time.time()}
-        handle_event(event_data)
+        if obj_event_type is not None:
+            event_data = {"ev_type": obj_event_type, "obj_type": obj_type, "path": relative_path}
+
+            add_event_to_db(event_data)
+
+            if obj_event_type == "DELETE":
+                handle_obj_delete(relative_path)
+            else:
+                handle_obj_add(relative_path)
 
 
 def file_system_event_watcher():
+    """ Receives file system change events from kernel
+
+        Passes the events to parser for processing.
+    """
     while True:
         for event in watcher.event_gen(yield_nones=False):
             (_, type_names, path, filename) = event
@@ -329,6 +408,7 @@ parser.add_argument("--port", help="Communication port.", required=False, defaul
 parser.add_argument("--host", help="If running in client mode, IP or URL to host.", required=False, type=ascii, default="")
 args = parser.parse_args()
 check_args()
+init_database()
 
 print("Watching {}".format(ROOT))
 event_mask = (inotify.constants.IN_CREATE
@@ -338,11 +418,15 @@ event_mask = (inotify.constants.IN_CREATE
 watcher = inotify.adapters.InotifyTree(ROOT, mask=event_mask)
 
 print("Building file list. Please wait.")
-build_file_list()
+handle_obj_add("/")
 
 t_fs_watcher = threading.Thread(target=file_system_event_watcher)
 t_fs_watcher.daemon = True
 t_fs_watcher.start()
 
-
-ws_server()
+try:
+    ws_server()
+finally:
+    if os.path.exists(DATABASE):
+        print("Deleting database:{}".format(DATABASE))
+        os.remove(DATABASE)
