@@ -5,8 +5,18 @@ import hashlib
 import argparse
 import sys
 import inotify.adapters
+import inotify.constants
 import time
+import sqlite3
+from tendo import singleton
+import threading
+import asyncio
+import json
+import websockets
 
+me = singleton.SingleInstance()
+db = None
+DATABASE = os.path.join(os.path.expanduser('~'), ".dir-mirror.db")
 ROOT = "/"
 MODE = None
 PORT = None
@@ -32,6 +42,31 @@ def calc_hash(file_path):
             chunk = f.read(8192)
 
     return file_hash.hexdigest()
+
+
+def db_open():
+    global db
+
+    db = sqlite3.connect(DATABASE)
+
+
+def db_close():
+    global db
+
+    db.close()
+
+
+def query_db(query, args=(), one=False):
+    cur = db.execute(query, args)
+    rv = [dict((cur.description[idx][0], value)
+               for idx, value in enumerate(row)) for row in cur.fetchall()]
+    return (rv[0] if rv else None) if one else rv
+
+
+def exec_db(query):
+    db.execute(query)
+    if not query.startswith('SELECT'):
+        db.commit()
 
 
 def get_stat(file_path):
@@ -175,11 +210,22 @@ def check_args():
 
     HOST = args.host.replace("'", "")
     MODE = args.mode.replace("'", "")
-    if 'client' in MODE:
+    if 'client' in args.mode.replace("'", ""):
+        MODE = 'client'
+        print("Running in client mode.")
         if len(HOST) < 5:
             sys.exit("ERROR: please specify a valid host to connect to.")
+    else:
+        MODE = 'server'
+        print("Running in server mode.")
 
     PORT = args.port
+    try:
+        PORT = int(args.port)
+        if PORT < 80:
+            sys.exit("ERROR, Please specify a port higher than 80.")
+    except Exception as e:
+        sys.exit("ERROR: {}, \n\tPlease specify a port higher than 80.".format(e))
 
 
 def handle_event(event_data):
@@ -230,22 +276,18 @@ def parse_event(ev_type, ev_path, ev_file_name):
 
     global event_queue
 
-    watch_events = ['CREATE', 'MOVED_TO', 'MOVED_FROM', 'DELETE']
     obj_event_type = None
     obj_type = 'file'
 
     if len(ev_file_name) > 0:
-        for i in range(0, len(watch_events)):
-            w_event = watch_events[i]
-            for event_type in ev_type:
-                if 'ISDIR' in event_type:
-                    obj_type = 'dir'
+        for event_type in ev_type:
+            if 'ISDIR' in event_type:
+                obj_type = 'dir'
 
-                if w_event in event_type:
-                    if i < 2:
-                        obj_event_type = "CREATE"
-                    else:
-                        obj_event_type = "DELETE"
+            if "CREATE" in event_type or "MOVED_TO" in event_type:
+                obj_event_type = "CREATE"
+            elif "DELETE" in event_type or "MOVED_FROM" in event_type:
+                obj_event_type = "DELETE"
 
     full_path = os.path.join(ev_path, ev_file_name)
     relative_path = full_path[len(ROOT):].strip('/')
@@ -253,6 +295,30 @@ def parse_event(ev_type, ev_path, ev_file_name):
     if obj_event_type is not None:
         event_data = {"ev_type": obj_event_type, "obj_type": obj_type, "path": relative_path, "time": time.time()}
         handle_event(event_data)
+
+
+def file_system_event_watcher():
+    while True:
+        for event in watcher.event_gen(yield_nones=False):
+            (_, type_names, path, filename) = event
+            parse_event(type_names, path, filename)
+
+
+# Websocket communication
+async def get_events(websocket, path):
+    request = await websocket.recv()
+    print("Rx:", request)
+
+    response = "New " + request
+    print("Tx:", response)
+
+    await websocket.send(response)
+
+
+def ws_server():
+    start_server = websockets.serve(get_events, "0.0.0.0", PORT)
+    asyncio.get_event_loop().run_until_complete(start_server)
+    asyncio.get_event_loop().run_forever()
 
 
 # Parse arguments
@@ -265,15 +331,18 @@ args = parser.parse_args()
 check_args()
 
 print("Watching {}".format(ROOT))
-watcher = inotify.adapters.InotifyTree(ROOT)
+event_mask = (inotify.constants.IN_CREATE
+              | inotify.constants.IN_MOVED_TO
+              | inotify.constants.IN_MOVED_FROM
+              | inotify.constants.IN_DELETE)
+watcher = inotify.adapters.InotifyTree(ROOT, mask=event_mask)
 
 print("Building file list. Please wait.")
 build_file_list()
 
-print("Waiting for a client...")
+t_fs_watcher = threading.Thread(target=file_system_event_watcher)
+t_fs_watcher.daemon = True
+t_fs_watcher.start()
 
-while True:
-    for event in watcher.event_gen(yield_nones=False):
-        (_, type_names, path, filename) = event
-        parse_event(type_names, path, filename)
 
+ws_server()
