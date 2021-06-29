@@ -426,8 +426,6 @@ def parse_client_request(request):
     if 'request' in request.keys():
         if request['request'] == 'get_files':
             response_data['response'] = get_all_files_from_db()
-            response = json.dumps(response_data)
-            yield response
 
         elif request['request'] == 'get_file_content':
             if 'path' in request.keys():
@@ -448,11 +446,11 @@ def parse_client_request(request):
                         yield data
                     f.close()
 
+                    response_data = None
+                else:
+                    response_data = {'code': "ERROR", 'response': "No such file: {}".format(request['path'])}
             else:
-                response_data['code'] = "ERROR"
-                response_data['response'] = "Unsupported request"
-                response = json.dumps(response_data)
-                yield response
+                response_data = {'code': "ERROR", 'response': "Unsupported request"}
 
         elif request['request'] == 'update_file':
             if 'path' in request.keys():
@@ -477,22 +475,12 @@ def parse_client_request(request):
                     new_file_size = request['size']
                     new_file_hash = request['hash']
 
-                    response_data['code'] = "OK"
-                    response_data['response'] = ""
-                    response = json.dumps(response_data)
-                    yield response
+                    response_data = {'code': "OK", 'response': ""}
                 else:
                     new_file_size = 0
-                    response_data['code'] = "ERROR"
-                    response_data['response'] = "Existing file newer."
-                    response = json.dumps(response_data)
-                    yield response
-
+                    response_data = {'code': "ERROR", 'response': "Existing file newer."}
             else:
-                response_data['code'] = "ERROR"
-                response_data['response'] = "Unsupported request"
-                response = json.dumps(response_data)
-                yield response
+                response_data = {'code': "ERROR", 'response': "Unsupported request"}
 
         elif request['request'] == 'get_events':
             if 'time' in request.keys():
@@ -500,10 +488,10 @@ def parse_client_request(request):
             else:
                 timestamp = 0
             response_data['response'] = json.dumps(get_events_from_db(timestamp))
-            response = json.dumps(response_data)
-            yield response
 
         elif request['request'] == 'set_events':
+            response_data = {'code': "ERROR", 'response': "Unknown request"}
+
             if 'events' in request.keys():
                 try:
                     # INSERT INTO events (ev_type, obj_type, path, hash, time
@@ -511,33 +499,44 @@ def parse_client_request(request):
                         if event['ev_type'] == 'DELETE':
                             if 'path' in event.keys():
                                 full_path = os.path.join(ROOT, event['path'].strip('/'))
+                                file_data = get_file_from_db(event['path'])
                                 if os.path.isfile(full_path):
-                                    file_data = get_file_from_db(event['path'])
+                                    do_delete_flag = True
+                                    if len(file_data) > 0:
+                                        if file_data['hash'] != event['hash']:
+                                            response_data = {'code': "ERROR",
+                                                             'response': "Not same file: {}".format(event['path'])}
+                                            do_delete_flag = False
 
+                                    if do_delete_flag:
+                                        if os.path.isfile(full_path):
+                                            os.remove(full_path)
+                                            response_data = {'code': "OK", 'response': ""}
+                                        elif os.path.isdir(full_path):
+                                            shutil.rmtree(full_path)
+                                            response_data = {'code': "OK", 'response': ""}
+                                        else:
+                                            response_data = {'code': "ERROR",
+                                                             'response': "Unsupported file type: {}".format(
+                                                                 event['path'])}
+                                else:
+                                    response_data = {'code': "ERROR",
+                                                     'response': "No such file: {}".format(event['path'])}
                             else:
                                 response_data = {'code': "ERROR", 'response': "Error parsing event. No path specified"}
-                                response = json.dumps(response_data)
-                                yield response
                         else:
-                            response_data = {'code': "ERROR", 'response': "Unsupported event: {}".format(event['ev_type'])}
-                            response = json.dumps(response_data)
-                            yield response
+                            response_data = {'code': "ERROR",
+                                             'response': "Unsupported event: {}".format(event['ev_type'])}
 
                 except Exception as e:
                     print("ERROR: could not parse events\n\t{}".format(e))
                     response_data = {'code': "ERROR", 'response': "could not parse events."}
-                    response = json.dumps(response_data)
-                    yield response
-
         else:
-            response_data['code'] = "ERROR"
-            response_data['response'] = "Unknown request"
-            response = json.dumps(response_data)
-            yield response
-
+            response_data = {'code': "ERROR", 'response': "Unknown request"}
     else:
-        response_data['code'] = "ERROR"
-        response_data['response'] = "No request specified"
+        response_data = {'code': "ERROR", 'response': "No request specified"}
+
+    if response_data is not None:
         response = json.dumps(response_data)
         yield response
 
