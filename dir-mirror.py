@@ -76,7 +76,7 @@ def init_database():
 
     # Create an event queue table
     sql = "create table events (id INTEGER PRIMARY KEY AUTOINCREMENT, ev_type TEXT, obj_type TEXT, path TEXT, " \
-          ", hash TEXT, time INTEGER)"
+          "hash TEXT, time INTEGER)"
     db.execute(sql)
 
     # Create a file and folder list table
@@ -424,10 +424,7 @@ def parse_client_request(request):
     response_data = {"code": "OK"}
 
     if 'request' in request.keys():
-        if request['request'] == 'get_files':
-            response_data['response'] = get_all_files_from_db()
-
-        elif request['request'] == 'get_file_content':
+        if request['request'] == 'get_file':
             if 'path' in request.keys():
                 full_path = os.path.join(ROOT, request['path'].strip('/'))
                 if os.path.isfile(full_path):
@@ -450,7 +447,7 @@ def parse_client_request(request):
                 else:
                     response_data = {'code': "ERROR", 'response': "No such file: {}".format(request['path'])}
             else:
-                response_data = {'code': "ERROR", 'response': "Unsupported request"}
+                response_data['response'] = get_all_files_from_db()
 
         elif request['request'] == 'update_file':
             if 'path' in request.keys():
@@ -581,6 +578,11 @@ def new_file_receive(raw_data):
 
 
 def socket_server():
+    """ Main server loop.
+
+        Receives string data and sending to parser for processing.
+        Receives raw data and sends it to file receiver to write it to file system
+    """
     print("Listening for requests on port {}\n".format(PORT), flush=True)
 
     # Open the server socket
@@ -619,11 +621,67 @@ def socket_server():
                     conn.sendall("ERROR parsing message".encode())
 
 
+def query_remote_server(msg):
+    response = ""
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        request = json.dumps(msg)
+
+        s.connect((HOST, PORT))
+        s.sendall(request.encode())
+
+        while True:
+            data = s.recv(1024)
+            if data:
+                response += data.decode()
+                if response.endswith('\n'):
+                    break
+            else:
+                break
+
+    try:
+        server_response = json.loads(response)
+    except Exception as e:
+        print("ERROR parsing server response: {}".format(response))
+        server_response = {}
+
+    return server_response
+
+
+def socket_client():
+    """ Main client loop.
+
+        Periodically asks remote server for new events and sends local events to server.
+        Sends the server response to the response parser.
+    """
+    # First ask for all available files. Save ping time so we can later ask for events
+    # that occurred since we received all files
+    ping_timestamp = time.time()
+    # Get file without specifying path, so get all...
+    msg = {'request': 'get_file'}
+    response = query_remote_server(msg)
+    if 'response' in response.keys():
+        try:
+            for file_data in response['response']:
+                print(file_data)
+        except Exception as e:
+            print("ERROR parsing file list: {}".format(e))
+
+    while True:
+        if (time.time() - ping_timestamp) > 600:
+            # Ping the server every 600s
+
+            # response = query_remote_server(msg)
+
+            ping_timestamp = time.time()
+
+
+
 # Parse arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("--root", help="Folder to monitor.", required=True, type=ascii)
 parser.add_argument("--mode", help="Operational mode (server or client).", required=True, type=ascii)
-parser.add_argument("--port", help="Communication port.", required=False, default="1313", type=int)
+parser.add_argument("--port", help="Communication port.", required=False, default="31313", type=int)
 parser.add_argument("--host", help="If running in client mode, IP or URL to host.", required=False, type=ascii, default="")
 args = parser.parse_args()
 check_args()
@@ -647,8 +705,7 @@ try:
     if MODE == 'server':
         socket_server()
     else:
-        pass
-        # ws_client()
+        socket_client()
 finally:
     if os.path.exists(DATABASE):
         print("Deleting database:{}".format(DATABASE))
