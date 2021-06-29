@@ -1,18 +1,24 @@
 #!/usr/bin/python3
 
-import asyncio
-import websockets
+import socket
+import json
 
+HOST = "0.0.0.0"
+PORT = 1313
 
-async def hello():
-    uri = "ws://localhost:1313"
-    async with websockets.connect(uri) as websocket:
-        msg = "Test msg"
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    msg = {'request': 'get_file_content', 'path': '/Statistika za 1. kvartal 2021. godine.docx'}
+    request = json.dumps(msg) + "\n"
 
-        await websocket.send(msg)
-        print("Tx:", msg)
+    s.connect((HOST, PORT))
+    s.sendall(request.encode())
 
-        response = await websocket.recv()
-        print("Rx", response)
+    response = ""
+    while True:
+        data = s.recv(1)
+        if data:
+            response += data.decode()
+        else:
+            break
 
-asyncio.get_event_loop().run_until_complete(hello())
+print('Received:', response)

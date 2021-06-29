@@ -9,9 +9,9 @@ import inotify.constants
 import time
 import sqlite3
 import threading
-import asyncio
 import json
-import websockets
+import socket
+import shutil
 
 DATABASE = None
 db = None
@@ -19,6 +19,13 @@ ROOT = "/"
 MODE = None
 PORT = None
 HOST = None
+EVENT_LIFETIME = 6 * 60 * 60        # 6 hours event lifetime. After this it is deleted from the database
+last_event_cleanup_time = 0
+new_file_temp_path = ''
+new_file_path = ''
+new_file_mtime = ''
+new_file_size = 0
+new_file_hash = ''
 
 
 def calc_hash(file_path):
@@ -69,7 +76,7 @@ def init_database():
 
     # Create an event queue table
     sql = "create table events (id INTEGER PRIMARY KEY AUTOINCREMENT, ev_type TEXT, obj_type TEXT, path TEXT, " \
-          "time INTEGER)"
+          ", hash TEXT, time INTEGER)"
     db.execute(sql)
 
     # Create a file and folder list table
@@ -92,8 +99,8 @@ def add_event_to_db(event):
     db_open()
 
     try:
-        sql = "INSERT INTO events (ev_type, obj_type, path, time) VALUES ('{}', '{}', '{}', '{}')" \
-              "".format(event['ev_type'], event['obj_type'], event['path'], time.time())
+        sql = "INSERT INTO events (ev_type, obj_type, path, hash, time) VALUES ('{}', '{}', '{}', '{}', '{}')" \
+              "".format(event['ev_type'], event['obj_type'], event['path'], event['hash'], int(time.time()))
         db.execute(sql)
         db.commit()
     except Exception as e:
@@ -106,7 +113,7 @@ def get_events_from_db(from_time):
     """ Retrieves all events from database that happened after specified timestamp. """
     global db
 
-    sql = "SELECT * FROM events WHERE time > '{}'".format(from_time)
+    sql = "SELECT * FROM events WHERE time > '{}' ORDER BY time".format(int(from_time))
     db_open()
     result = query_db(sql, one=True)
     db.close()
@@ -114,16 +121,22 @@ def get_events_from_db(from_time):
     return result
 
 
-def delete_events_from_db(from_time):
-    """ Deletes all events from database that happened before specified timestamp. """
+def cleanup_events_from_db():
     global db
+    global EVENT_LIFETIME
+    global last_event_cleanup_time
 
-    sql = "DELETE * FROM events WHERE time < '{}'".format(from_time)
-    db_open()
-    result = query_db(sql, one=True)
-    db.close()
+    if (time.time() - last_event_cleanup_time) > (60 * 60):
+        # Only do the cleanup every hour to avoid calling database too often
+        oldest_acceptable_time = time.time() - EVENT_LIFETIME
 
-    return result
+        sql = "DELETE FROM events WHERE time < {}".format(oldest_acceptable_time)
+        db_open()
+        db.execute(sql)
+        db.commit()
+        db.close()
+
+        last_event_cleanup_time = time.time()
 
 
 def get_file_from_db(path):
@@ -132,6 +145,17 @@ def get_file_from_db(path):
     sql = "SELECT * FROM files WHERE path='{}'".format(path)
     db_open()
     result = query_db(sql, one=True)
+    db.close()
+
+    return result
+
+
+def get_all_files_from_db():
+    global db
+
+    sql = "SELECT * FROM files"
+    db_open()
+    result = query_db(sql)
     db.close()
 
     return result
@@ -209,7 +233,7 @@ def remove_file_from_db(path):
                 db.execute(sql)
 
             # Delete the requested entry
-            sql = "DELETE FROM files WHERE path ='{}'".format(path)
+            sql = "DELETE FROM files WHERE path = '{}'".format(path)
             db.execute(sql)
             db.commit()
 
@@ -275,6 +299,8 @@ def handle_obj_add(relative_path):
                     if file_stat is not None:
                         update_file_in_db(relative_path, file_stat['type'], file_stat['mtime'], file_stat['size'], file_stat['hash'])
 
+    return obj_stat['hash']
+
 
 def handle_obj_delete(relative_path):
     # Get the dir object from db
@@ -301,6 +327,8 @@ def handle_obj_delete(relative_path):
 
     # Finally delete self from database
     remove_file_from_db(relative_path)
+
+    return obj['hash']
 
 
 def check_args():
@@ -343,12 +371,14 @@ def parse_event(ev_type, ev_path, ev_file_name):
         obj_type can be either "file" or "folder"
         path is a path relative to the ROOT directory.
     """
-    global event_queue
+    # print("EVENT:", ev_type, ev_path, ev_file_name)
+
+    cleanup_events_from_db()
 
     obj_event_type = None
     obj_type = 'file'
 
-    if len(ev_file_name) > 0 and '.dir-mirror' not in ev_path:
+    if len(ev_file_name) > 0 and '.dir-mirror' not in ev_path and not ev_file_name.startswith('.'):
         for event_type in ev_type:
             if 'ISDIR' in event_type:
                 obj_type = 'dir'
@@ -362,14 +392,13 @@ def parse_event(ev_type, ev_path, ev_file_name):
         relative_path = '/' + full_path[len(ROOT):].strip('/')
 
         if obj_event_type is not None:
-            event_data = {"ev_type": obj_event_type, "obj_type": obj_type, "path": relative_path}
-
-            add_event_to_db(event_data)
-
             if obj_event_type == "DELETE":
-                handle_obj_delete(relative_path)
+                hash = handle_obj_delete(relative_path)
             else:
-                handle_obj_add(relative_path)
+                hash = handle_obj_add(relative_path)
+
+            event_data = {"ev_type": obj_event_type, "obj_type": obj_type, "path": relative_path, "hash": hash}
+            add_event_to_db(event_data)
 
 
 def file_system_event_watcher():
@@ -383,21 +412,212 @@ def file_system_event_watcher():
             parse_event(type_names, path, filename)
 
 
-# Websocket communication
-async def get_events(websocket, path):
-    request = await websocket.recv()
-    print("Rx:", request)
+def parse_client_request(request):
+    global new_file_temp_path
+    global new_file_path
+    global new_file_size
+    global new_file_mtime
+    global new_file_hash
 
-    response = "New " + request
-    print("Tx:", response)
+    print("Parsing request: {}".format(request), flush=True)
 
-    await websocket.send(response)
+    response_data = {"code": "OK"}
+
+    if 'request' in request.keys():
+        if request['request'] == 'get_files':
+            response_data['response'] = get_all_files_from_db()
+            response = json.dumps(response_data)
+            yield response
+
+        elif request['request'] == 'get_file_content':
+            if 'path' in request.keys():
+                full_path = os.path.join(ROOT, request['path'].strip('/'))
+                if os.path.isfile(full_path):
+                    file_data = get_file_from_db(request['path'])
+
+                    response_msg = {'path': file_data['path'], 'size': file_data['size'], 'hash': file_data['hash'],
+                                    'mtime': file_data['mtime']}
+                    response = json.dumps(response_msg) + '\n'
+                    yield response
+
+                    f = open(full_path, 'rb')
+                    while True:
+                        data = f.read(1024)
+                        if not data:
+                            break
+                        yield data
+                    f.close()
+
+            else:
+                response_data['code'] = "ERROR"
+                response_data['response'] = "Unsupported request"
+                response = json.dumps(response_data)
+                yield response
+
+        elif request['request'] == 'update_file':
+            if 'path' in request.keys():
+                file_name = os.path.basename(request['path'])
+                old_file_full_path = os.path.join(ROOT, request['path'].strip('/'))
+                new_file_temp_path = os.path.join(ROOT, '.dir-mirror', file_name)
+
+                if os.path.isfile(old_file_full_path):
+                    file_data = get_file_from_db(request['path'])
+                    current_mtime = file_data['mtime']
+                else:
+                    current_mtime = 0
+
+                if 'mtime' in request.keys():
+                    new_file_mtime = request['mtime']
+                else:
+                    new_file_mtime = -1
+
+                if current_mtime < new_file_mtime:
+                    # New file is newer or old file does not exist. Receive it.
+                    new_file_path = request['path']
+                    new_file_size = request['size']
+                    new_file_hash = request['hash']
+
+                    response_data['code'] = "OK"
+                    response_data['response'] = ""
+                    response = json.dumps(response_data)
+                    yield response
+                else:
+                    new_file_size = 0
+                    response_data['code'] = "ERROR"
+                    response_data['response'] = "Existing file newer."
+                    response = json.dumps(response_data)
+                    yield response
+
+            else:
+                response_data['code'] = "ERROR"
+                response_data['response'] = "Unsupported request"
+                response = json.dumps(response_data)
+                yield response
+
+        elif request['request'] == 'get_events':
+            if 'time' in request.keys():
+                timestamp = request['time']
+            else:
+                timestamp = 0
+            response_data['response'] = json.dumps(get_events_from_db(timestamp))
+            response = json.dumps(response_data)
+            yield response
+
+        elif request['request'] == 'set_events':
+            if 'events' in request.keys():
+                try:
+                    # INSERT INTO events (ev_type, obj_type, path, hash, time
+                    for event in request['events']:
+                        if event['ev_type'] == 'DELETE':
+                            if 'path' in event.keys():
+                                full_path = os.path.join(ROOT, event['path'].strip('/'))
+                                if os.path.isfile(full_path):
+                                    file_data = get_file_from_db(event['path'])
+
+                            else:
+                                response_data = {'code': "ERROR", 'response': "Error parsing event. No path specified"}
+                                response = json.dumps(response_data)
+                                yield response
+                        else:
+                            response_data = {'code': "ERROR", 'response': "Unsupported event: {}".format(event['ev_type'])}
+                            response = json.dumps(response_data)
+                            yield response
+
+                except Exception as e:
+                    print("ERROR: could not parse events\n\t{}".format(e))
+                    response_data = {'code': "ERROR", 'response': "could not parse events."}
+                    response = json.dumps(response_data)
+                    yield response
+
+        else:
+            response_data['code'] = "ERROR"
+            response_data['response'] = "Unknown request"
+            response = json.dumps(response_data)
+            yield response
+
+    else:
+        response_data['code'] = "ERROR"
+        response_data['response'] = "No request specified"
+        response = json.dumps(response_data)
+        yield response
 
 
-def ws_server():
-    start_server = websockets.serve(get_events, "0.0.0.0", PORT)
-    asyncio.get_event_loop().run_until_complete(start_server)
-    asyncio.get_event_loop().run_forever()
+def new_file_receive(raw_data):
+    global new_file_temp_path
+    global new_file_path
+    global new_file_size
+    global new_file_mtime
+    global new_file_hash
+
+    f = open(new_file_temp_path, 'rb')
+    f.write(raw_data)
+    f.close()
+
+    new_file_size -= raw_data
+
+    response_data = {'code': "OK", 'response': ""}
+    if new_file_size <= 0:
+        # Writing done. Check hash.
+        hash = calc_hash(new_file_temp_path)
+        if hash != new_file_hash:
+            response_data = {'code': "ERROR", 'response': "bad hash"}
+        else:
+            old_file_full_path = os.path.join(ROOT, new_file_path.strip('/'))
+
+            if os.path.isfile(old_file_full_path):
+                file_data = get_file_from_db(new_file_path)
+                current_mtime = file_data['mtime']
+            else:
+                current_mtime = 0
+
+            if current_mtime < new_file_mtime:
+                # New file is newer or old file does not exist. Move it to specified location
+                os.makedirs(os.path.dirname(old_file_full_path))
+                shutil.move(new_file_temp_path, old_file_full_path)
+                response_data = {'code': "OK", 'response': "Done"}
+            else:
+                response_data = {'code': "ERROR", 'response': "Old file is newer"}
+
+    return json.dumps(response_data)
+
+
+def socket_server():
+    print("Listening for requests on port {}\n".format(PORT), flush=True)
+
+    # Open the server socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("0.0.0.0", PORT))
+        s.listen(1)     # Limit to one client at a time to avoid race conditions
+        while True:
+            # Wait for a connection from a client
+            conn, addr = s.accept()
+            with conn:
+                # Client is connected. Receive a message.
+                msg = ''
+                while True:
+                    data = conn.recv(1024)
+
+                    if not data:
+                        break
+                    else:
+                        if new_file_size > 0:
+                            answer = new_file_receive(data)
+                            conn.sendall(answer.encode())
+                        else:
+                            msg += data.decode()
+                            if msg.endswith('\n'):
+                                break
+
+                # Parse the received message and send response
+                try:
+                    if len(msg) > 5:
+                        request = json.loads(msg)
+                        for answer in parse_client_request(request):
+                            conn.sendall(answer.encode())
+                            
+                except Exception as e:
+                    print("ERROR parsing message: {}:\n\t{}".format(msg, e))
+                    conn.sendall("ERROR parsing message".encode())
 
 
 # Parse arguments
@@ -425,7 +645,11 @@ t_fs_watcher.daemon = True
 t_fs_watcher.start()
 
 try:
-    ws_server()
+    if MODE == 'server':
+        socket_server()
+    else:
+        pass
+        # ws_client()
 finally:
     if os.path.exists(DATABASE):
         print("Deleting database:{}".format(DATABASE))
