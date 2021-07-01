@@ -534,7 +534,7 @@ def parse_client_request(request):
         response_data = {'code': "ERROR", 'response': "No request specified"}
 
     if response_data is not None:
-        response = json.dumps(response_data)
+        response = json.dumps(response_data) + '\n'
         yield response
 
 
@@ -574,7 +574,7 @@ def new_file_receive(raw_data):
             else:
                 response_data = {'code': "ERROR", 'response': "Old file is newer"}
 
-    return json.dumps(response_data)
+    return json.dumps(response_data) + '\n'
 
 
 def socket_server():
@@ -625,8 +625,7 @@ def query_remote_server(msg):
     response = ""
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        request = json.dumps(msg)
-
+        request = json.dumps(msg) + "\n"
         s.connect((HOST, PORT))
         s.sendall(request.encode())
 
@@ -648,33 +647,191 @@ def query_remote_server(msg):
     return server_response
 
 
+def client_fetch_remote_file(relative_path):
+
+    file_name = os.path.basename(relative_path)
+    new_file_full_path = os.path.join(ROOT, relative_path.strip('/'))
+    temp_path = os.path.join(ROOT, '.dir-mirror', file_name)
+
+    msg = {'request': 'get_file', 'path': relative_path}
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        request = json.dumps(msg) + "\n"
+        s.connect((HOST, PORT))
+        s.sendall(request.encode())
+
+        response = ''
+        while True:
+            data = s.recv(1024)
+            if data:
+                response += data.decode()
+                if response.endswith('\n'):
+                    break
+            else:
+                break
+
+        f = open(temp_path, 'rb')
+        try:
+            file_data = json.loads(response)
+            # Receive file
+            size = file_data['size']
+
+            while True:
+                data = s.recv(1024)
+                if data:
+                    f.write(data)
+                    size -= len(data)
+
+                    if size <= 0:
+                        break
+                else:
+                    break
+
+            f.close()
+
+            # Calculate hash
+            hash = calc_hash(temp_path)
+            if hash != file_data['hash']:
+                print("ERROR receiving file {}\n\tHash does not match".format(relative_path))
+                os.remove(temp_path)
+            else:
+                os.makedirs(os.path.dirname(new_file_full_path))
+                shutil.move(temp_path, new_file_full_path)
+        except Exception as e:
+            print("ERROR receiving file {}\n\t{}".format(relative_path, e))
+            f.close()
+            os.remove(temp_path)
+
+
+def client_send_local_file(relative_path):
+    full_path = os.path.join(ROOT, relative_path.strip('/'))
+    msg = get_file_from_db(relative_path)
+    msg['request'] = 'update_file'
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        request = json.dumps(msg) + "\n"
+        s.connect((HOST, PORT))
+        s.sendall(request.encode())
+        response = ''
+        while True:
+            data = s.recv(1024)
+            if data:
+                response += data.decode()
+                if response.endswith('\n'):
+                    break
+            else:
+                break
+
+        f = open(full_path, 'rb')
+        # Send file
+        while True:
+            try:
+                server_response = json.loads(response)
+                if server_response.get('code', '') == 'OK':
+                    data = f.read(1024)
+                    if not data:
+                        break
+                    s.sendall(data)
+                    response = s.recv(1024).decode()
+
+            except Exception as e:
+                print("ERROR parsing server response: {}".format(response))
+                break
+        f.close()
+        response = s.recv(1024).decode()
+        print("Final server response:", response)
+
+
+def client_sync_remote_file(remote_file_data):
+    print(remote_file_data)
+    try:
+        # Check if we have the file. Ignore folders as we will create the full branch anyway
+        # and have no need for empty folders
+        if remote_file_data['type'] == 'file':
+            full_path = os.path.join(ROOT, remote_file_data['path'].strip('/'))
+            if os.path.isfile(full_path):
+                # We already have this file. Check if different, newer,...
+                file_data = get_file_from_db(remote_file_data['path'])
+                if file_data['hash'] != remote_file_data['hash']:
+                    if file_data['mtime'] > remote_file_data['mtime']:
+                        # local file is newer send it
+                        client_send_local_file(remote_file_data['path'])
+                    else:
+                        # Remote file is newer. Fetch it.
+                        client_fetch_remote_file(remote_file_data['path'])
+
+            else:
+                # We do not have this file. Fetch it.
+                client_fetch_remote_file(remote_file_data['path'])
+
+    except Exception as e:
+        print("ERROR parsing file data: {}:\n\t".format(e, file_data))
+
+
+def client_sync_local_files(remote_file_list):
+    # Check which files we have and send ones that do not exist on the remote system
+    pass
+
+
+def client_handle_remote_event(remote_event):
+    print("Remote event: ", remote_event)
+
+
+def client_handle_local_event(local_event):
+    # Only send DELETE events as event. CREATE file events send as update_file request
+    print(local_event)
+
+
 def socket_client():
     """ Main client loop.
 
         Periodically asks remote server for new events and sends local events to server.
         Sends the server response to the response parser.
     """
-    # First ask for all available files. Save ping time so we can later ask for events
-    # that occurred since we received all files
-    ping_timestamp = time.time()
-    # Get file without specifying path, so get all...
+
+    last_remote_event_time = time.time()
+    # First ask for all available files. Get file without specifying path, so get all...
     msg = {'request': 'get_file'}
     response = query_remote_server(msg)
+
     if 'response' in response.keys():
         try:
-            for file_data in response['response']:
-                print(file_data)
+            for remote_file_data in response['response']:
+                client_sync_remote_file(remote_file_data)
+
+            last_local_event_time = time.time()
+            client_sync_local_files(response['response'])
+
+            while True:
+                # Ping the server every 60s.
+                time.sleep(60)
+
+                # First check remote events.
+                msg = {'request': 'get_events', 'time': last_event_time}
+                response = query_remote_server(msg)
+
+                if 'response' in response.keys():
+                    try:
+                        for event in response['response']:
+                            client_handle_remote_event(event)
+
+                            if event['time'] > last_remote_event_time:
+                                last_remote_event_time = event['time']
+
+                    except Exception as e:
+                        print("ERROR parsing remote event list: {}".format(e))
+
+                    # Check local events
+                    local_events = get_events_from_db(last_local_event_time)
+                    for event in local_events:
+                        client_handle_local_event(event)
+                        if event['time'] > last_local_event_time:
+                            last_local_event_time = event['time']
+
         except Exception as e:
             print("ERROR parsing file list: {}".format(e))
-
-    while True:
-        if (time.time() - ping_timestamp) > 600:
-            # Ping the server every 600s
-
-            # response = query_remote_server(msg)
-
-            ping_timestamp = time.time()
-
+    else:
+        print("Unexpected server response: {}".format(response))
 
 
 # Parse arguments
