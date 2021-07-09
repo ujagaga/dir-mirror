@@ -14,7 +14,6 @@ import socket
 import shutil
 
 DATABASE = None
-db = None
 ROOT = "/"
 MODE = None
 PORT = None
@@ -26,6 +25,8 @@ new_file_path = ''
 new_file_mtime = ''
 new_file_size = 0
 new_file_hash = ''
+MAX_CLIENT_SYNC_TIMEOUT = 30
+client_sync_timeout = 1
 
 
 def calc_hash(file_path):
@@ -39,29 +40,15 @@ def calc_hash(file_path):
     return file_hash.hexdigest()
 
 
-# Database basic functions
-def db_open():
-    global db
-
-    db = sqlite3.connect(DATABASE)
-
-
-def query_db(query, args=(), one=False):
+def query_db(db, query, args=(), one=False):
     cur = db.execute(query, args)
     rv = [dict((cur.description[idx][0], value)
                for idx, value in enumerate(row)) for row in cur.fetchall()]
     return (rv[0] if rv else None) if one else rv
 
 
-def exec_db(query):
-    db.execute(query)
-    if not query.startswith('SELECT'):
-        db.commit()
-
-
 def init_database():
     global DATABASE
-    global db
 
     db_dir = os.path.join(ROOT, '.dir-mirror')
     if not os.path.isdir(db_dir):
@@ -78,14 +65,14 @@ def init_database():
     sql = "create table events (id INTEGER PRIMARY KEY AUTOINCREMENT, ev_type TEXT, obj_type TEXT, path TEXT, " \
           "hash TEXT, time INTEGER)"
     db.execute(sql)
+    db.commit()
 
     # Create a file and folder list table
-    sql = "create table files (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT, type TEXT, mtime INTEGER, " \
+    sql = "create table files (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT, obj_type TEXT, mtime INTEGER, " \
           "size INTEGER, hash TEXT, content TEXT)"
     db.execute(sql)
-
-    # Save changes and close
     db.commit()
+
     db.close()
 
 
@@ -94,9 +81,7 @@ def add_event_to_db(event):
         event to add in format:
             {'ev_type': <CREATE or DELETE>, 'obj_type': <file or dir>, 'path': <object path relative to ROOT>}
     """
-    global db
-
-    db_open()
+    db = sqlite3.connect(DATABASE)
 
     try:
         sql = "INSERT INTO events (ev_type, obj_type, path, hash, time) VALUES ('{}', '{}', '{}', '{}', '{}')" \
@@ -111,18 +96,16 @@ def add_event_to_db(event):
 
 def get_events_from_db(from_time):
     """ Retrieves all events from database that happened after specified timestamp. """
-    global db
 
     sql = "SELECT * FROM events WHERE time > '{}' ORDER BY time".format(int(from_time))
-    db_open()
-    result = query_db(sql, one=True)
+    db = sqlite3.connect(DATABASE)
+    result = query_db(db, sql)
     db.close()
 
     return result
 
 
 def cleanup_events_from_db():
-    global db
     global EVENT_LIFETIME
     global last_event_cleanup_time
 
@@ -131,7 +114,7 @@ def cleanup_events_from_db():
         oldest_acceptable_time = time.time() - EVENT_LIFETIME
 
         sql = "DELETE FROM events WHERE time < {}".format(oldest_acceptable_time)
-        db_open()
+        db = sqlite3.connect(DATABASE)
         db.execute(sql)
         db.commit()
         db.close()
@@ -140,22 +123,18 @@ def cleanup_events_from_db():
 
 
 def get_file_from_db(path):
-    global db
-
     sql = "SELECT * FROM files WHERE path='{}'".format(path)
-    db_open()
-    result = query_db(sql, one=True)
+    db = sqlite3.connect(DATABASE)
+    result = query_db(db, sql, one=True)
     db.close()
 
     return result
 
 
 def get_all_files_from_db():
-    global db
-
     sql = "SELECT * FROM files"
-    db_open()
-    result = query_db(sql)
+    db = sqlite3.connect(DATABASE)
+    result = query_db(db, sql)
     db.close()
 
     return result
@@ -170,20 +149,18 @@ def update_file_in_db(path, type, mtime, size, hash):
         size: <size in bytes if it is a file>,
         hash: <file hash if it is a file>,
     """
-    global db
-
-    db_open()
+    db = sqlite3.connect(DATABASE)
 
     try:
         # Add requested file
         sql = "SELECT id FROM files WHERE path='{}'".format(path)
-        result = query_db(sql, one=True)
+        result = query_db(db, sql, one=True)
 
         if result is None:
-            sql = "INSERT INTO files (path, type, mtime, size, hash, content) VALUES " \
+            sql = "INSERT INTO files (path, obj_type, mtime, size, hash, content) VALUES " \
                   "('{}', '{}', '{}', '{}', '{}', '{}')".format(path, type, mtime, size, hash, '[]')
         else:
-            sql = "UPDATE files SET path='{}', type='{}', mtime='{}', size='{}', hash='{}'" \
+            sql = "UPDATE files SET path='{}', obj_type='{}', mtime='{}', size='{}', hash='{}'" \
                   "WHERE id='{}'".format(path, type, mtime, size, hash, result['id'])
 
         db.execute(sql)
@@ -193,7 +170,7 @@ def update_file_in_db(path, type, mtime, size, hash):
             parent_path = os.path.dirname(path)
             obj_name = '/' + os.path.basename(path)
             sql = "SELECT * FROM files WHERE path='{}'".format(parent_path)
-            parent = query_db(sql, one=True)
+            parent = query_db(db, sql, one=True)
             if parent is not None:
                 # Update parent content
                 content = json.loads(parent['content'])
@@ -204,8 +181,9 @@ def update_file_in_db(path, type, mtime, size, hash):
 
         db.commit()
 
-    except Exception as e:
-        print("ERROR writing files to db: {}".format(e))
+    except Exception as exc:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("ERROR writing files to db on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
     db.close()
 
@@ -215,16 +193,15 @@ def remove_file_from_db(path):
 
         path is a path to the file or folder to remove
     """
-    global db
 
-    db_open()
+    db = sqlite3.connect(DATABASE)
     try:
         if path != '/':
             # Find parent dir
             parent_path = os.path.dirname(path)
             obj_name = '/' + os.path.basename(path)
             sql = "SELECT * FROM files WHERE path='{}'".format(parent_path)
-            parent = query_db(sql, one=True)
+            parent = query_db(db, sql, one=True)
             if parent is not None:
                 # Delete file form parent content
                 content = json.loads(parent['content'])
@@ -237,8 +214,9 @@ def remove_file_from_db(path):
             db.execute(sql)
             db.commit()
 
-    except Exception as e:
-        print("ERROR removing files from db: {}".format(e))
+    except Exception as exc:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("ERROR removing files from db on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
     db.close()
 
@@ -264,12 +242,13 @@ def get_stat(file_path):
             ftype = 'unsupported'
 
         if ftype != 'unsupported':
-            info = {'type': ftype, 'mtime': mtime, 'size': fsize, 'hash': fhash}
+            info = {'obj_type': ftype, 'mtime': mtime, 'size': fsize, 'hash': fhash}
         else:
             print("Warning, Unsupported file:{}".format(file_path))
 
-    except Exception as e:
-        print("ERROR in stat for:{}\n\t{}".format(file_path, e))
+    except Exception as exc:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("ERROR getting stats on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
     return info
 
@@ -278,9 +257,9 @@ def handle_obj_add(relative_path):
     full_obj_path = os.path.join(ROOT, relative_path.strip("/"))
     obj_stat = get_stat(full_obj_path)
 
-    update_file_in_db(relative_path, obj_stat['type'], obj_stat['mtime'], obj_stat['size'], obj_stat['hash'])
+    update_file_in_db(relative_path, obj_stat['obj_type'], obj_stat['mtime'], obj_stat['size'], obj_stat['hash'])
 
-    if obj_stat['type'] == 'dir':
+    if obj_stat['obj_type'] == 'dir':
         # Add children to self content
         for root, d_names, f_names in os.walk(full_obj_path):
             # Add folder to self content
@@ -288,7 +267,7 @@ def handle_obj_add(relative_path):
             root_stat = get_stat(root)
 
             if root_stat is not None and '.dir-mirror' not in relative_root:
-                update_file_in_db(relative_root, root_stat['type'], root_stat['mtime'], root_stat['size'], root_stat['hash'])
+                update_file_in_db(relative_root, root_stat['obj_type'], root_stat['mtime'], root_stat['size'], root_stat['hash'])
 
                 # Add files
                 for f in f_names:
@@ -297,7 +276,7 @@ def handle_obj_add(relative_path):
                     file_stat = get_stat(full_path)
 
                     if file_stat is not None:
-                        update_file_in_db(relative_path, file_stat['type'], file_stat['mtime'], file_stat['size'], file_stat['hash'])
+                        update_file_in_db(relative_path, file_stat['obj_type'], file_stat['mtime'], file_stat['size'], file_stat['hash'])
 
     return obj_stat['hash']
 
@@ -306,7 +285,7 @@ def handle_obj_delete(relative_path):
     # Get the dir object from db
     obj = get_file_from_db(relative_path)
 
-    if obj['type'] == 'dir':
+    if obj['obj_type'] == 'dir':
         obj_content = json.loads(obj['content'])
 
         # Delete children
@@ -317,13 +296,14 @@ def handle_obj_delete(relative_path):
                 # get child
                 child = get_file_from_db(child_relative_path)
 
-                if child["type"] == 'dir':
+                if child['obj_type'] == 'dir':
                     handle_obj_delete(child_relative_path)
                 else:
                     remove_file_from_db(child_relative_path)
 
-        except Exception as ed:
-            print("ERROR listing children:\n\t{}".format(ed))
+        except Exception as exc:
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            print("ERROR listing children on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
     # Finally delete self from database
     remove_file_from_db(relative_path)
@@ -359,8 +339,8 @@ def check_args():
         PORT = int(args.port)
         if PORT < 80:
             sys.exit("ERROR, Please specify a port higher than 80.")
-    except Exception as e:
-        sys.exit("ERROR: {}, \n\tPlease specify a port higher than 80.".format(e))
+    except Exception as exc:
+        sys.exit("ERROR: {}, \n\tPlease specify a port higher than 80.".format(exc))
 
 
 def parse_event(ev_type, ev_path, ev_file_name):
@@ -387,6 +367,7 @@ def parse_event(ev_type, ev_path, ev_file_name):
                 obj_event_type = "CREATE"
             elif "DELETE" in event_type or "MOVED_FROM" in event_type:
                 obj_event_type = "DELETE"
+
 
         full_path = os.path.join(ev_path, ev_file_name)
         relative_path = '/' + full_path[len(ROOT):].strip('/')
@@ -450,32 +431,40 @@ def parse_client_request(request):
                 response_data['response'] = get_all_files_from_db()
 
         elif request['request'] == 'update_file':
-            if 'path' in request.keys():
-                file_name = os.path.basename(request['path'])
-                old_file_full_path = os.path.join(ROOT, request['path'].strip('/'))
-                new_file_temp_path = os.path.join(ROOT, '.dir-mirror', file_name)
+            if 'path' in request.keys() and 'obj_type' in request.keys():
+                if request['obj_type'] == 'file':
+                    file_name = os.path.basename(request['path'])
+                    old_file_full_path = os.path.join(ROOT, request['path'].strip('/'))
+                    new_file_temp_path = os.path.join(ROOT, '.dir-mirror', file_name)
 
-                if os.path.isfile(old_file_full_path):
-                    file_data = get_file_from_db(request['path'])
-                    current_mtime = file_data['mtime']
+                    if os.path.isfile(old_file_full_path):
+                        file_data = get_file_from_db(request['path'])
+                        current_mtime = file_data['mtime']
+                    else:
+                        current_mtime = 0
+
+                    if 'mtime' in request.keys():
+                        try:
+                            new_file_mtime = int(request['mtime'])
+                        except:
+                            new_file_mtime = -1
+                    else:
+                        new_file_mtime = -1
+
+                    if current_mtime < new_file_mtime:
+                        # New file is newer or old file does not exist. Receive it.
+                        new_file_path = request['path']
+                        new_file_size = request['size']
+                        new_file_hash = request['hash']
+
+                        print("***   new_file_size: {}, new_file_path: {}".format(new_file_size, new_file_path))
+
+                        response_data = {'code': "OK", 'response': ""}
+                    else:
+                        new_file_size = 0
+                        response_data = {'code': "ERROR", 'response': "Existing file newer."}
                 else:
-                    current_mtime = 0
-
-                if 'mtime' in request.keys():
-                    new_file_mtime = request['mtime']
-                else:
-                    new_file_mtime = -1
-
-                if current_mtime < new_file_mtime:
-                    # New file is newer or old file does not exist. Receive it.
-                    new_file_path = request['path']
-                    new_file_size = request['size']
-                    new_file_hash = request['hash']
-
-                    response_data = {'code': "OK", 'response': ""}
-                else:
-                    new_file_size = 0
-                    response_data = {'code': "ERROR", 'response': "Existing file newer."}
+                    response_data = {'code': "ERROR", 'response': "Unsupported object type: {}".format(request['obj_type'])}
             else:
                 response_data = {'code': "ERROR", 'response': "Unsupported request"}
 
@@ -491,13 +480,12 @@ def parse_client_request(request):
 
             if 'events' in request.keys():
                 try:
-                    # INSERT INTO events (ev_type, obj_type, path, hash, time
                     for event in request['events']:
                         if event['ev_type'] == 'DELETE':
                             if 'path' in event.keys():
                                 full_path = os.path.join(ROOT, event['path'].strip('/'))
                                 file_data = get_file_from_db(event['path'])
-                                if os.path.isfile(full_path):
+                                if os.path.exists(full_path):
                                     do_delete_flag = True
                                     if len(file_data) > 0:
                                         if file_data['hash'] != event['hash']:
@@ -525,8 +513,9 @@ def parse_client_request(request):
                             response_data = {'code': "ERROR",
                                              'response': "Unsupported event: {}".format(event['ev_type'])}
 
-                except Exception as e:
-                    print("ERROR: could not parse events\n\t{}".format(e))
+                except Exception as exc:
+                    exc_type, exc_obj, exc_tb = sys.exc_info()
+                    print("ERROR could not parse events on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
                     response_data = {'code': "ERROR", 'response': "could not parse events."}
         else:
             response_data = {'code': "ERROR", 'response': "Unknown request"}
@@ -538,87 +527,105 @@ def parse_client_request(request):
         yield response
 
 
-def new_file_receive(raw_data):
-    global new_file_temp_path
-    global new_file_path
-    global new_file_size
-    global new_file_mtime
-    global new_file_hash
-
-    f = open(new_file_temp_path, 'rb')
-    f.write(raw_data)
-    f.close()
-
-    new_file_size -= raw_data
-
-    response_data = {'code': "OK", 'response': ""}
-    if new_file_size <= 0:
-        # Writing done. Check hash.
-        hash = calc_hash(new_file_temp_path)
-        if hash != new_file_hash:
-            response_data = {'code': "ERROR", 'response': "bad hash"}
-        else:
-            old_file_full_path = os.path.join(ROOT, new_file_path.strip('/'))
-
-            if os.path.isfile(old_file_full_path):
-                file_data = get_file_from_db(new_file_path)
-                current_mtime = file_data['mtime']
-            else:
-                current_mtime = 0
-
-            if current_mtime < new_file_mtime:
-                # New file is newer or old file does not exist. Move it to specified location
-                os.makedirs(os.path.dirname(old_file_full_path))
-                shutil.move(new_file_temp_path, old_file_full_path)
-                response_data = {'code': "OK", 'response': "Done"}
-            else:
-                response_data = {'code': "ERROR", 'response': "Old file is newer"}
-
-    return json.dumps(response_data) + '\n'
-
-
 def socket_server():
     """ Main server loop.
 
         Receives string data and sending to parser for processing.
         Receives raw data and sends it to file receiver to write it to file system
     """
+    global new_file_temp_path
+    global new_file_path
+    global new_file_size
+    global new_file_mtime
+    global new_file_hash
+
     print("Listening for requests on port {}\n".format(PORT), flush=True)
 
-    # Open the server socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("0.0.0.0", PORT))
-        s.listen(1)     # Limit to one client at a time to avoid race conditions
-        while True:
-            # Wait for a connection from a client
-            conn, addr = s.accept()
-            with conn:
-                # Client is connected. Receive a message.
-                msg = ''
+    while True:
+        try:
+            # Open the server socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("0.0.0.0", PORT))
+                s.listen(1)     # Limit to one client at a time to avoid race conditions
                 while True:
-                    data = conn.recv(1024)
-
-                    if not data:
-                        break
-                    else:
+                    # Wait for a connection from a client
+                    conn, addr = s.accept()
+                    with conn:
+                        # Client is connected. Receive a message.
                         if new_file_size > 0:
-                            answer = new_file_receive(data)
-                            conn.sendall(answer.encode())
-                        else:
-                            msg += data.decode()
-                            if msg.endswith('\n'):
-                                break
+                            print("Receiving new file:", new_file_temp_path)
+                            f = open(new_file_temp_path, 'wb')
+                            while new_file_size > 0:
+                                data = conn.recv(1)
+                                if not data:
+                                    new_file_size = 0
+                                    break
 
-                # Parse the received message and send response
-                try:
-                    if len(msg) > 5:
-                        request = json.loads(msg)
-                        for answer in parse_client_request(request):
-                            conn.sendall(answer.encode())
-                            
-                except Exception as e:
-                    print("ERROR parsing message: {}:\n\t{}".format(msg, e))
-                    conn.sendall("ERROR parsing message".encode())
+                                else:
+                                    f.write(data)
+                                    new_file_size -= len(data)
+
+                                    if new_file_size <= 0:
+                                        new_file_size = 0
+                                        f.close()
+                                        f = None
+
+                                        # Writing done. Check hash.
+                                        hash = calc_hash(new_file_temp_path)
+                                        if hash != new_file_hash:
+                                            print("ERROR: bad hash")
+                                        else:
+                                            old_file_full_path = os.path.join(ROOT, new_file_path.strip('/'))
+
+                                            if os.path.isfile(old_file_full_path):
+                                                file_data = get_file_from_db(new_file_path)
+                                                current_mtime = file_data['mtime']
+                                            else:
+                                                current_mtime = 0
+
+                                            if current_mtime < new_file_mtime:
+
+                                                # New file is newer or old file does not exist.
+                                                # Move it to specified location
+                                                new_dir = os.path.dirname(old_file_full_path)
+                                                if not os.path.isdir(new_dir):
+                                                    os.makedirs(new_dir)
+
+                                                shutil.move(new_file_temp_path, old_file_full_path)
+                                            else:
+                                                print("ERROR: Old file is newer")
+                                        break
+                            if f:
+                                f.close()
+                        else:
+                            msg = ''
+                            while True:
+                                data = conn.recv(1)
+                                if not data:
+                                    break
+                                else:
+                                    msg += data.decode()
+                                    if msg.endswith('\n'):
+                                        break
+
+                            # Parse the received message and send response
+                            try:
+                                if len(msg) > 5:
+                                    request = json.loads(msg)
+                                    for answer in parse_client_request(request):
+                                        try:
+                                            response = answer.encode()
+                                        except:
+                                            response = answer
+
+                                        conn.sendall(response)
+
+                            except Exception as exc:
+                                exc_type, exc_obj, exc_tb = sys.exc_info()
+                                print("ERROR parsing message on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
+                                conn.sendall("ERROR parsing message".encode())
+        except:
+            time.sleep(5)
 
 
 def query_remote_server(msg):
@@ -630,7 +637,7 @@ def query_remote_server(msg):
         s.sendall(request.encode())
 
         while True:
-            data = s.recv(1024)
+            data = s.recv(1)
             if data:
                 response += data.decode()
                 if response.endswith('\n'):
@@ -640,15 +647,16 @@ def query_remote_server(msg):
 
     try:
         server_response = json.loads(response)
-    except Exception as e:
-        print("ERROR parsing server response: {}".format(response))
+    except Exception as exc:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("ERROR parsing server response {}\n on line {}!\n\t{}".format(response, exc_tb.tb_lineno, exc))
         server_response = {}
 
     return server_response
 
 
 def client_fetch_remote_file(relative_path):
-
+    print("client_fetch_remote_file:", relative_path)
     file_name = os.path.basename(relative_path)
     new_file_full_path = os.path.join(ROOT, relative_path.strip('/'))
     temp_path = os.path.join(ROOT, '.dir-mirror', file_name)
@@ -662,15 +670,16 @@ def client_fetch_remote_file(relative_path):
 
         response = ''
         while True:
-            data = s.recv(1024)
+            data = s.recv(1)
             if data:
                 response += data.decode()
                 if response.endswith('\n'):
                     break
             else:
                 break
+        print("Server response: {}".format(response))
 
-        f = open(temp_path, 'rb')
+        f = open(temp_path, 'wb')
         try:
             file_data = json.loads(response)
             # Receive file
@@ -695,18 +704,24 @@ def client_fetch_remote_file(relative_path):
                 print("ERROR receiving file {}\n\tHash does not match".format(relative_path))
                 os.remove(temp_path)
             else:
-                os.makedirs(os.path.dirname(new_file_full_path))
+                dir_name = os.path.dirname(new_file_full_path)
+                if not os.path.isdir(dir_name):
+                    os.makedirs(dir_name)
                 shutil.move(temp_path, new_file_full_path)
-        except Exception as e:
-            print("ERROR receiving file {}\n\t{}".format(relative_path, e))
+        except Exception as exc:
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            print("ERROR receiving file {}\n on line {}!\n\t{}".format(relative_path, exc_tb.tb_lineno, exc))
             f.close()
             os.remove(temp_path)
 
 
 def client_send_local_file(relative_path):
+    print("client_send_local_file: ", path)
     full_path = os.path.join(ROOT, relative_path.strip('/'))
     msg = get_file_from_db(relative_path)
     msg['request'] = 'update_file'
+
+    server_response = {}
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         request = json.dumps(msg) + "\n"
@@ -714,7 +729,7 @@ def client_send_local_file(relative_path):
         s.sendall(request.encode())
         response = ''
         while True:
-            data = s.recv(1024)
+            data = s.recv(1)
             if data:
                 response += data.decode()
                 if response.endswith('\n'):
@@ -722,64 +737,133 @@ def client_send_local_file(relative_path):
             else:
                 break
 
-        f = open(full_path, 'rb')
-        # Send file
-        while True:
-            try:
-                server_response = json.loads(response)
-                if server_response.get('code', '') == 'OK':
-                    data = f.read(1024)
-                    if not data:
-                        break
-                    s.sendall(data)
-                    response = s.recv(1024).decode()
+        server_response = json.loads(response)
 
-            except Exception as e:
-                print("ERROR parsing server response: {}".format(response))
-                break
-        f.close()
-        response = s.recv(1024).decode()
-        print("Final server response:", response)
+    if server_response.get('code', '') == 'OK':
+        # Send file
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            f = open(full_path, 'rb')
+            s.connect((HOST, PORT))
+            data = True
+            while data:
+                data = f.read(1024)
+                if data:
+                    s.sendall(data)
+            f.close()
 
 
 def client_sync_remote_file(remote_file_data):
-    print(remote_file_data)
+    print("client_sync_remote_file:", remote_file_data, type(remote_file_data))
+    relative_path = remote_file_data['path']
     try:
         # Check if we have the file. Ignore folders as we will create the full branch anyway
         # and have no need for empty folders
-        if remote_file_data['type'] == 'file':
-            full_path = os.path.join(ROOT, remote_file_data['path'].strip('/'))
+        if remote_file_data['obj_type'] == 'file':
+            full_path = os.path.join(ROOT, relative_path.strip('/'))
             if os.path.isfile(full_path):
                 # We already have this file. Check if different, newer,...
-                file_data = get_file_from_db(remote_file_data['path'])
+                file_data = get_file_from_db(relative_path)
                 if file_data['hash'] != remote_file_data['hash']:
-                    if file_data['mtime'] > remote_file_data['mtime']:
+
+                    if int(file_data.get('mtime', 0)) > int(remote_file_data.get('mtime', 0)):
                         # local file is newer send it
-                        client_send_local_file(remote_file_data['path'])
+                        client_send_local_file(relative_path)
                     else:
                         # Remote file is newer. Fetch it.
-                        client_fetch_remote_file(remote_file_data['path'])
+                        client_fetch_remote_file(relative_path)
+                else:
+                    print("Already exists")
 
             else:
                 # We do not have this file. Fetch it.
-                client_fetch_remote_file(remote_file_data['path'])
+                client_fetch_remote_file(relative_path)
 
-    except Exception as e:
-        print("ERROR parsing file data: {}:\n\t".format(e, file_data))
+    except Exception as exc:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("ERROR parsing file data: {}\n on line {}!\n\t{}".format(remote_file_data, exc_tb.tb_lineno, exc))
 
 
 def client_sync_local_files(remote_file_list):
     # Check which files we have and send ones that do not exist on the remote system
-    pass
+    print("Sync local files. Remote files:", remote_file_list, type(remote_file_list))
+    # Create a dictionary of remote files only, not dirs
+    remote_file_dict = {}
+    if isinstance(remote_file_list, list) and len(remote_file_list) > 0:
+        for obj in remote_file_list:
+            try:
+                if obj.get('obj_type', '') == 'file':
+                    obj_properties = {'hash': obj.get('hash', ''), 'mtime': obj.get('mtime', '')}
+                    remote_file_dict[obj['path']] = obj_properties
+
+            except Exception as exc:
+                exc_type, exc_obj, exc_tb = sys.exc_info()
+                print("ERROR parsing object on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
+
+    # Now that we have a list of remote files, we can list local files and check for missing
+    try:
+        for loc_obj in get_all_files_from_db():
+            if loc_obj['obj_type'] == 'file':
+                if loc_obj['path'] in remote_file_dict.keys():
+                    # This file exists on the server. Check if different.
+                    remote_file = remote_file_dict[loc_obj['path']]
+                    if loc_obj['hash'] != remote_file['hash']:
+                        # Files are different. Check which is newer.
+                        if int(loc_obj.get('mtime', 0)) > int(remote_file.get('mtime', 0)):
+                            # Local file is newer
+                            client_send_local_file(loc_obj['path'])
+                        else:
+                            # Get remote file
+                            client_sync_remote_file(loc_obj)
+                else:
+                    client_send_local_file(loc_obj['path'])
+
+    except Exception as exc:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("ERROR parsing local file list, on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
 
 def client_handle_remote_event(remote_event):
-    print("Remote event: ", remote_event)
+    # print("client_handle_remote_event. Remote event: ", remote_event)
+    try:
+        if remote_event['ev_type'] == 'CREATE':
+            client_sync_remote_file(remote_event)
+        elif remote_event['ev_type'] == 'DELETE':
+            full_path = os.path.join(ROOT, remote_event['path'].strip('/'))
+            if os.path.exists(full_path):
+                # We have this file/folder. Delete it
+                if os.path.isfile(full_path):
+                    os.remove(full_path)
+                elif os.path.isdir(full_path):
+                    shutil.rmtree(full_path)
+
+    except Exception as exc:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("ERROR parsing remote event on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
 
 def client_handle_local_event(local_event):
     # Only send DELETE events as event. CREATE file events send as update_file request
-    print(local_event)
+    print("client_handle_local_event:", local_event)
+    if local_event['ev_type'] == 'CREATE':
+        client_send_local_file(local_event['path'])
+
+    elif local_event['ev_type'] == 'DELETE':
+        msg = {'request': 'set_events', 'events': [local_event]}
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            request = json.dumps(msg) + "\n"
+            s.connect((HOST, PORT))
+            s.sendall(request.encode())
+            response = ''
+            while True:
+                data = s.recv(1024)
+                if data:
+                    response += data.decode()
+                    if response.endswith('\n'):
+                        break
+                else:
+                    break
+            print("Server response:", response)
 
 
 def socket_client():
@@ -788,8 +872,10 @@ def socket_client():
         Periodically asks remote server for new events and sends local events to server.
         Sends the server response to the response parser.
     """
+    global client_sync_timeout
 
     last_remote_event_time = time.time()
+    last_sync_time = time.time()
     # First ask for all available files. Get file without specifying path, so get all...
     msg = {'request': 'get_file'}
     response = query_remote_server(msg)
@@ -803,33 +889,50 @@ def socket_client():
             client_sync_local_files(response['response'])
 
             while True:
-                # Ping the server every 60s.
-                time.sleep(60)
+                time.sleep(1)
 
-                # First check remote events.
-                msg = {'request': 'get_events', 'time': last_event_time}
-                response = query_remote_server(msg)
+                # Check local events
+                local_events = get_events_from_db(last_local_event_time)
 
-                if 'response' in response.keys():
-                    try:
-                        for event in response['response']:
-                            client_handle_remote_event(event)
+                if len(local_events) > 0:
+                    # New events occurred. Sync more often.
+                    client_sync_timeout = 1
 
-                            if event['time'] > last_remote_event_time:
-                                last_remote_event_time = event['time']
-
-                    except Exception as e:
-                        print("ERROR parsing remote event list: {}".format(e))
-
-                    # Check local events
-                    local_events = get_events_from_db(last_local_event_time)
                     for event in local_events:
                         client_handle_local_event(event)
-                        if event['time'] > last_local_event_time:
+                        if event['time'] >= last_local_event_time:
                             last_local_event_time = event['time']
 
-        except Exception as e:
-            print("ERROR parsing file list: {}".format(e))
+                if (time.time() - last_sync_time) > client_sync_timeout:
+                    # Check remote events.
+                    last_sync_time = time.time()
+                    msg = {'request': 'get_events', 'time': last_remote_event_time}
+                    response = query_remote_server(msg)
+
+                    print('RESPONSE: ', response)
+                    if 'response' in response.keys():
+                        try:
+                            event_list = json.loads(response['response'])
+                            if isinstance(event_list, list):
+                                if len(event_list) > 0:
+                                    client_sync_timeout = 1
+                                    for event in event_list:
+                                        client_handle_remote_event(event)
+
+                                        if event['time'] > last_remote_event_time:
+                                            last_remote_event_time = event['time']
+                                else:
+                                    # No new events. Increase sync timeout.
+                                    if client_sync_timeout < MAX_CLIENT_SYNC_TIMEOUT:
+                                        client_sync_timeout += 1
+
+                        except Exception as exc:
+                            exc_type, exc_obj, exc_tb = sys.exc_info()
+                            print("ERROR parsing remote event list on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
+
+        except Exception as exc:
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            print("ERROR parsing file list on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
     else:
         print("Unexpected server response: {}".format(response))
 
@@ -849,7 +952,11 @@ event_mask = (inotify.constants.IN_CREATE
               | inotify.constants.IN_MOVED_TO
               | inotify.constants.IN_MOVED_FROM
               | inotify.constants.IN_DELETE)
-watcher = inotify.adapters.InotifyTree(ROOT, mask=event_mask)
+
+try:
+    watcher = inotify.adapters.InotifyTree(ROOT, mask=event_mask)
+except Exception as e:
+    sys.exit("ERROR setting up file watcher: {}".format(e))
 
 print("Building file list. Please wait.")
 handle_obj_add("/")
