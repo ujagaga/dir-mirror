@@ -131,8 +131,11 @@ def get_file_from_db(path):
     return result
 
 
-def get_all_files_from_db():
+def get_all_files_from_db(dir_path=None):
     sql = "SELECT * FROM files"
+    if dir_path is not None:
+        sql += " WHERE path LIKE '{}'".format(dir_path)
+
     db = sqlite3.connect(DATABASE)
     result = query_db(db, sql)
     db.close()
@@ -254,6 +257,9 @@ def get_stat(file_path):
 
 
 def handle_obj_add(relative_path):
+    """ When creating objects, entire content and paths need to be noted in the file database,
+        but in event database, we only need events for creating files. Directories will be created consequently.
+    """
     full_obj_path = os.path.join(ROOT, relative_path.strip("/"))
     obj_stat = get_stat(full_obj_path)
 
@@ -277,13 +283,22 @@ def handle_obj_add(relative_path):
 
                     if file_stat is not None:
                         update_file_in_db(relative_path, file_stat['obj_type'], file_stat['mtime'], file_stat['size'], file_stat['hash'])
+                        # Add file create event
+                        event_data = {"ev_type": "CREATE", "obj_type": file_stat['obj_type'], "path": relative_path, "hash": file_stat['hash']}
+                        add_event_to_db(event_data)
 
-    return obj_stat['hash']
-
+    else:
+        # Add file create event
+        event_data = {"ev_type": "CREATE", "obj_type": obj_stat['obj_type'], "path": relative_path, "hash": obj_stat['hash']}
+        add_event_to_db(event_data)
 
 def handle_obj_delete(relative_path):
     # Get the dir object from db
     obj = get_file_from_db(relative_path)
+
+    # When deleting a directory, we only need event for whole directory, not the children, as they will get deleted consequently.
+    event_data = {"ev_type": "DELETE", "obj_type": obj['obj_type'], "path": relative_path, "hash": obj['hash']}
+    add_event_to_db(event_data)
 
     if obj['obj_type'] == 'dir':
         obj_content = json.loads(obj['content'])
@@ -307,8 +322,6 @@ def handle_obj_delete(relative_path):
 
     # Finally delete self from database
     remove_file_from_db(relative_path)
-
-    return obj['hash']
 
 
 def check_args():
@@ -356,30 +369,22 @@ def parse_event(ev_type, ev_path, ev_file_name):
     cleanup_events_from_db()
 
     obj_event_type = None
-    obj_type = 'file'
 
     if len(ev_file_name) > 0 and '.dir-mirror' not in ev_path and not ev_file_name.startswith('.'):
         for event_type in ev_type:
-            if 'ISDIR' in event_type:
-                obj_type = 'dir'
-
-            if "CREATE" in event_type or "MOVED_TO" in event_type:
+            if "CREATE" in event_type or "MOVED_TO" in event_type or "MODIFY" in event_type:
                 obj_event_type = "CREATE"
             elif "DELETE" in event_type or "MOVED_FROM" in event_type:
                 obj_event_type = "DELETE"
-
 
         full_path = os.path.join(ev_path, ev_file_name)
         relative_path = '/' + full_path[len(ROOT):].strip('/')
 
         if obj_event_type is not None:
             if obj_event_type == "DELETE":
-                hash = handle_obj_delete(relative_path)
+                handle_obj_delete(relative_path)
             else:
-                hash = handle_obj_add(relative_path)
-
-            event_data = {"ev_type": obj_event_type, "obj_type": obj_type, "path": relative_path, "hash": hash}
-            add_event_to_db(event_data)
+                handle_obj_add(relative_path)
 
 
 def file_system_event_watcher():
@@ -425,6 +430,8 @@ def parse_client_request(request):
                     f.close()
 
                     response_data = None
+                elif os.path.isdir(full_path):
+                    response_data['response'] = get_all_files_from_db(request['path'])
                 else:
                     response_data = {'code': "ERROR", 'response': "No such file: {}".format(request['path'])}
             else:
@@ -716,7 +723,8 @@ def client_fetch_remote_file(relative_path):
 
 
 def client_send_local_file(relative_path):
-    print("client_send_local_file: ", path)
+    print("client_send_local_file: ", relative_path)
+
     full_path = os.path.join(ROOT, relative_path.strip('/'))
     msg = get_file_from_db(relative_path)
     msg['request'] = 'update_file'
@@ -753,7 +761,7 @@ def client_send_local_file(relative_path):
 
 
 def client_sync_remote_file(remote_file_data):
-    print("client_sync_remote_file:", remote_file_data, type(remote_file_data))
+    print("client_sync_remote_file:", remote_file_data)
     relative_path = remote_file_data['path']
     try:
         # Check if we have the file. Ignore folders as we will create the full branch anyway
@@ -763,17 +771,21 @@ def client_sync_remote_file(remote_file_data):
             if os.path.isfile(full_path):
                 # We already have this file. Check if different, newer,...
                 file_data = get_file_from_db(relative_path)
-                if file_data['hash'] != remote_file_data['hash']:
+                if file_data is not None:
+                    if file_data['hash'] != remote_file_data['hash']:
+                        remote_event_time = int(remote_file_data.get('time', 0))
 
-                    if int(file_data.get('mtime', 0)) > int(remote_file_data.get('mtime', 0)):
-                        # local file is newer send it
-                        client_send_local_file(relative_path)
+                        if int(file_data.get('mtime', 0)) > int(remote_file_data.get('mtime', remote_event_time)):
+                            # local file is newer send it
+                            client_send_local_file(relative_path)
+                        else:
+                            # Remote file is newer. Fetch it.
+                            client_fetch_remote_file(relative_path)
                     else:
-                        # Remote file is newer. Fetch it.
-                        client_fetch_remote_file(relative_path)
-                else:
-                    print("Already exists")
-
+                        print("Already exists")
+                # else:
+                #     # We have not yet detected this file. Fetch it.
+                #     client_fetch_remote_file(relative_path)
             else:
                 # We do not have this file. Fetch it.
                 client_fetch_remote_file(relative_path)
@@ -825,10 +837,28 @@ def client_sync_local_files(remote_file_list):
 def client_handle_remote_event(remote_event):
     # print("client_handle_remote_event. Remote event: ", remote_event)
     try:
+        full_path = os.path.join(ROOT, remote_event['path'].strip('/'))
+
         if remote_event['ev_type'] == 'CREATE':
-            client_sync_remote_file(remote_event)
+            print("client_handle_CREATE_event: ", remote_event)
+            if remote_event['obj_type'] == 'file':
+                print("handle_CREATE_file: ", full_path)
+                client_sync_remote_file(remote_event)
+            # elif remote_event['obj_type'] == 'dir':
+            #     msg = {'request': 'get_file', 'path': remote_event['path']}
+            #     response = query_remote_server(msg)
+            #
+            #     print('msg', msg, '\n\tRESPONSE: ', response)
+            #
+            #     if 'response' in response.keys():
+            #         for remote_obj_data in response['response']:
+            #             print("SYNC DIR: ", remote_obj_data)
+            #             if remote_obj_data['obj_type'] == 'dir':
+            #                 for relative_path in json.loads(remote_obj_data['content']):
+            #                     full_remote_path = os.path.join(remote_obj_data['path'], relative_path.strip('/'))
+            #                     client_fetch_remote_file(full_remote_path)
+
         elif remote_event['ev_type'] == 'DELETE':
-            full_path = os.path.join(ROOT, remote_event['path'].strip('/'))
             if os.path.exists(full_path):
                 # We have this file/folder. Delete it
                 if os.path.isfile(full_path):
@@ -844,26 +874,33 @@ def client_handle_remote_event(remote_event):
 def client_handle_local_event(local_event):
     # Only send DELETE events as event. CREATE file events send as update_file request
     print("client_handle_local_event:", local_event)
-    if local_event['ev_type'] == 'CREATE':
-        client_send_local_file(local_event['path'])
 
-    elif local_event['ev_type'] == 'DELETE':
-        msg = {'request': 'set_events', 'events': [local_event]}
+    try:
+        if local_event['ev_type'] == 'CREATE':
+            # only send created files. Directories will be created consequently.
+            if local_event['obj_type'] == 'file':
+                client_send_local_file(local_event['path'])
 
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            request = json.dumps(msg) + "\n"
-            s.connect((HOST, PORT))
-            s.sendall(request.encode())
-            response = ''
-            while True:
-                data = s.recv(1024)
-                if data:
-                    response += data.decode()
-                    if response.endswith('\n'):
+        elif local_event['ev_type'] == 'DELETE':
+            msg = {'request': 'set_events', 'events': [local_event]}
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                request = json.dumps(msg) + "\n"
+                s.connect((HOST, PORT))
+                s.sendall(request.encode())
+                response = ''
+                while True:
+                    data = s.recv(1024)
+                    if data:
+                        response += data.decode()
+                        if response.endswith('\n'):
+                            break
+                    else:
                         break
-                else:
-                    break
-            print("Server response:", response)
+                print("Server response:", response)
+    except Exception as exc:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("ERROR handling local event on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
 
 def socket_client():
@@ -951,7 +988,8 @@ print("Watching {}".format(ROOT))
 event_mask = (inotify.constants.IN_CREATE
               | inotify.constants.IN_MOVED_TO
               | inotify.constants.IN_MOVED_FROM
-              | inotify.constants.IN_DELETE)
+              | inotify.constants.IN_DELETE
+              | inotify.constants.IN_MODIFY)
 
 try:
     watcher = inotify.adapters.InotifyTree(ROOT, mask=event_mask)
