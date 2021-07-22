@@ -263,34 +263,38 @@ def handle_obj_add(relative_path):
     full_obj_path = os.path.join(ROOT, relative_path.strip("/"))
     obj_stat = get_stat(full_obj_path)
 
-    update_file_in_db(relative_path, obj_stat['obj_type'], obj_stat['mtime'], obj_stat['size'], obj_stat['hash'])
+    if obj_stat is not None:
+        update_file_in_db(relative_path, obj_stat['obj_type'], obj_stat['mtime'], obj_stat['size'], obj_stat['hash'])
 
-    if obj_stat['obj_type'] == 'dir':
-        # Add children to self content
-        for root, d_names, f_names in os.walk(full_obj_path):
-            # Add folder to self content
-            relative_root = '/' + root[len(ROOT):].strip('/')
-            root_stat = get_stat(root)
+        if obj_stat['obj_type'] == 'dir':
+            # Add children to self content
+            for root, d_names, f_names in os.walk(full_obj_path):
+                # Add folder to self content
+                relative_root = '/' + root[len(ROOT):].strip('/')
+                root_stat = get_stat(root)
 
-            if root_stat is not None and '.dir-mirror' not in relative_root:
-                update_file_in_db(relative_root, root_stat['obj_type'], root_stat['mtime'], root_stat['size'], root_stat['hash'])
+                if root_stat is not None and '.dir-mirror' not in relative_root:
+                    update_file_in_db(relative_root, root_stat['obj_type'], root_stat['mtime'], root_stat['size'], root_stat['hash'])
 
-                # Add files
-                for f in f_names:
-                    full_path = os.path.join(root, f)
-                    relative_path = os.path.join(relative_root, f)
-                    file_stat = get_stat(full_path)
+                    # Add files
+                    for f in f_names:
+                        full_path = os.path.join(root, f)
+                        relative_path = os.path.join(relative_root, f)
+                        file_stat = get_stat(full_path)
 
-                    if file_stat is not None:
-                        update_file_in_db(relative_path, file_stat['obj_type'], file_stat['mtime'], file_stat['size'], file_stat['hash'])
-                        # Add file create event
-                        event_data = {"ev_type": "CREATE", "obj_type": file_stat['obj_type'], "path": relative_path, "hash": file_stat['hash']}
-                        add_event_to_db(event_data)
+                        if file_stat is not None:
+                            update_file_in_db(relative_path, file_stat['obj_type'], file_stat['mtime'], file_stat['size'], file_stat['hash'])
+                            # Add file create event
+                            event_data = {"ev_type": "CREATE", "obj_type": file_stat['obj_type'], "path": relative_path, "hash": file_stat['hash']}
+                            add_event_to_db(event_data)
 
+        else:
+            # Add file create event
+            event_data = {"ev_type": "CREATE", "obj_type": obj_stat['obj_type'], "path": relative_path, "hash": obj_stat['hash']}
+            add_event_to_db(event_data)
     else:
-        # Add file create event
-        event_data = {"ev_type": "CREATE", "obj_type": obj_stat['obj_type'], "path": relative_path, "hash": obj_stat['hash']}
-        add_event_to_db(event_data)
+        print('ERROR: object not found:', relative_path)
+
 
 def handle_obj_delete(relative_path):
     # Get the dir object from db
@@ -686,39 +690,46 @@ def client_fetch_remote_file(relative_path):
                 break
         print("Server response: {}".format(response))
 
-        f = open(temp_path, 'wb')
+        f = None
         try:
             file_data = json.loads(response)
-            # Receive file
-            size = file_data['size']
 
-            while True:
-                data = s.recv(1024)
-                if data:
-                    f.write(data)
-                    size -= len(data)
-
-                    if size <= 0:
-                        break
-                else:
-                    break
-
-            f.close()
-
-            # Calculate hash
-            hash = calc_hash(temp_path)
-            if hash != file_data['hash']:
-                print("ERROR receiving file {}\n\tHash does not match".format(relative_path))
-                os.remove(temp_path)
+            if 'code' in file_data.keys() and file_data.get('code', 'ERROR') == 'ERROR':
+                print("ERROR receiving file {}\n Server responded: {}".format(relative_path, response))
             else:
-                dir_name = os.path.dirname(new_file_full_path)
-                if not os.path.isdir(dir_name):
-                    os.makedirs(dir_name)
-                shutil.move(temp_path, new_file_full_path)
+                # Receive file
+                size = file_data['size']
+
+                f = open(temp_path, 'wb')
+                while True:
+                    data = s.recv(1024)
+                    if data:
+                        f.write(data)
+                        size -= len(data)
+
+                        if size <= 0:
+                            break
+                    else:
+                        break
+
+                f.close()
+
+                # Calculate hash
+                hash = calc_hash(temp_path)
+                if hash != file_data['hash']:
+                    print("ERROR receiving file {}\n\tHash does not match".format(relative_path))
+                    os.remove(temp_path)
+                else:
+                    dir_name = os.path.dirname(new_file_full_path)
+                    if not os.path.isdir(dir_name):
+                        os.makedirs(dir_name)
+                    shutil.move(temp_path, new_file_full_path)
+
         except Exception as exc:
             exc_type, exc_obj, exc_tb = sys.exc_info()
             print("ERROR receiving file {}\n on line {}!\n\t{}".format(relative_path, exc_tb.tb_lineno, exc))
-            f.close()
+            if f is not None:
+                f.close()
             os.remove(temp_path)
 
 
