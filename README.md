@@ -15,7 +15,7 @@ The files with the same name will be overwritten with newer one (younger modify 
 keeping content in both locations identical.
 
 ## Current status
-The app is in development and not yet ready for use. Currently it can monitor file system changes and maintain a list of files, folders and events. The tcp communication is yet to be implemented.
+All features seem to work as expected. If you find a bug, please let me know
 
 ## Running
 To run as server:
