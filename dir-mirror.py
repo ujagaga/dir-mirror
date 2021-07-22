@@ -292,8 +292,6 @@ def handle_obj_add(relative_path):
             # Add file create event
             event_data = {"ev_type": "CREATE", "obj_type": obj_stat['obj_type'], "path": relative_path, "hash": obj_stat['hash']}
             add_event_to_db(event_data)
-    else:
-        print('ERROR: object not found:', relative_path)
 
 
 def handle_obj_delete(relative_path):
@@ -448,32 +446,36 @@ def parse_client_request(request):
                     old_file_full_path = os.path.join(ROOT, request['path'].strip('/'))
                     new_file_temp_path = os.path.join(ROOT, '.dir-mirror', file_name)
 
+                    done_processing = False
+
                     if os.path.isfile(old_file_full_path):
                         file_data = get_file_from_db(request['path'])
                         current_mtime = file_data['mtime']
+                        if request.get('hash', '') == file_data['hash']:
+                            response_data = {'code': "ERROR", 'response': "Same file already exists"}
+                            done_processing = True
                     else:
                         current_mtime = 0
 
-                    if 'mtime' in request.keys():
-                        try:
-                            new_file_mtime = int(request['mtime'])
-                        except:
+                    if not done_processing:
+                        if 'mtime' in request.keys():
+                            try:
+                                new_file_mtime = int(request['mtime'])
+                            except:
+                                new_file_mtime = -1
+                        else:
                             new_file_mtime = -1
-                    else:
-                        new_file_mtime = -1
 
-                    if current_mtime < new_file_mtime:
-                        # New file is newer or old file does not exist. Receive it.
-                        new_file_path = request['path']
-                        new_file_size = request['size']
-                        new_file_hash = request['hash']
+                        if current_mtime < new_file_mtime:
+                            # New file is newer or old file does not exist. Receive it.
+                            new_file_path = request['path']
+                            new_file_size = request['size']
+                            new_file_hash = request['hash']
 
-                        print("***   new_file_size: {}, new_file_path: {}".format(new_file_size, new_file_path))
-
-                        response_data = {'code': "OK", 'response': ""}
-                    else:
-                        new_file_size = 0
-                        response_data = {'code': "ERROR", 'response': "Existing file newer."}
+                            response_data = {'code': "OK", 'response': ""}
+                        else:
+                            new_file_size = 0
+                            response_data = {'code': "ERROR", 'response': "Existing file newer."}
                 else:
                     response_data = {'code': "ERROR", 'response': "Unsupported object type: {}".format(request['obj_type'])}
             else:
@@ -635,26 +637,33 @@ def socket_server():
                                 exc_type, exc_obj, exc_tb = sys.exc_info()
                                 print("ERROR parsing message on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
                                 conn.sendall("ERROR parsing message".encode())
-        except:
-            time.sleep(5)
+        except Exception as exc:
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            print("ERROR opening port on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
+            time.sleep(10)
 
 
 def query_remote_server(msg):
     response = ""
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        request = json.dumps(msg) + "\n"
-        s.connect((HOST, PORT))
-        s.sendall(request.encode())
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            request = json.dumps(msg) + "\n"
+            s.connect((HOST, PORT))
+            s.sendall(request.encode())
 
-        while True:
-            data = s.recv(1)
-            if data:
-                response += data.decode()
-                if response.endswith('\n'):
+            while True:
+                data = s.recv(1)
+                if data:
+                    response += data.decode()
+                    if response.endswith('\n'):
+                        break
+                else:
                     break
-            else:
-                break
+    except Exception as exc:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("ERROR communicating with server on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
+        return {}
 
     try:
         server_response = json.loads(response)
@@ -738,37 +747,41 @@ def client_send_local_file(relative_path):
 
     full_path = os.path.join(ROOT, relative_path.strip('/'))
     msg = get_file_from_db(relative_path)
-    msg['request'] = 'update_file'
 
-    server_response = {}
+    if msg is not None:
+        msg['request'] = 'update_file'
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        request = json.dumps(msg) + "\n"
-        s.connect((HOST, PORT))
-        s.sendall(request.encode())
-        response = ''
-        while True:
-            data = s.recv(1)
-            if data:
-                response += data.decode()
-                if response.endswith('\n'):
-                    break
-            else:
-                break
+        server_response = {}
 
-        server_response = json.loads(response)
-
-    if server_response.get('code', '') == 'OK':
-        # Send file
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            f = open(full_path, 'rb')
+            request = json.dumps(msg) + "\n"
             s.connect((HOST, PORT))
-            data = True
-            while data:
-                data = f.read(1024)
+            s.sendall(request.encode())
+            response = ''
+            while True:
+                data = s.recv(1)
                 if data:
-                    s.sendall(data)
-            f.close()
+                    response += data.decode()
+                    if response.endswith('\n'):
+                        break
+                else:
+                    break
+
+            server_response = json.loads(response)
+
+        if server_response.get('code', '') == 'OK':
+            # Send file
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                f = open(full_path, 'rb')
+                s.connect((HOST, PORT))
+                data = True
+                while data:
+                    data = f.read(1024)
+                    if data:
+                        s.sendall(data)
+                f.close()
+        else:
+            print("Not sending new file. Server says: {}".format(server_response) )
 
 
 def client_sync_remote_file(remote_file_data):
@@ -793,10 +806,7 @@ def client_sync_remote_file(remote_file_data):
                             # Remote file is newer. Fetch it.
                             client_fetch_remote_file(relative_path)
                     else:
-                        print("Already exists")
-                # else:
-                #     # We have not yet detected this file. Fetch it.
-                #     client_fetch_remote_file(relative_path)
+                        print("Not accepting new file. Same file already exists")
             else:
                 # We do not have this file. Fetch it.
                 client_fetch_remote_file(relative_path)
@@ -855,19 +865,6 @@ def client_handle_remote_event(remote_event):
             if remote_event['obj_type'] == 'file':
                 print("handle_CREATE_file: ", full_path)
                 client_sync_remote_file(remote_event)
-            # elif remote_event['obj_type'] == 'dir':
-            #     msg = {'request': 'get_file', 'path': remote_event['path']}
-            #     response = query_remote_server(msg)
-            #
-            #     print('msg', msg, '\n\tRESPONSE: ', response)
-            #
-            #     if 'response' in response.keys():
-            #         for remote_obj_data in response['response']:
-            #             print("SYNC DIR: ", remote_obj_data)
-            #             if remote_obj_data['obj_type'] == 'dir':
-            #                 for relative_path in json.loads(remote_obj_data['content']):
-            #                     full_remote_path = os.path.join(remote_obj_data['path'], relative_path.strip('/'))
-            #                     client_fetch_remote_file(full_remote_path)
 
         elif remote_event['ev_type'] == 'DELETE':
             if os.path.exists(full_path):
@@ -1018,7 +1015,9 @@ try:
     if MODE == 'server':
         socket_server()
     else:
-        socket_client()
+        while True:
+            socket_client()
+            time.sleep(10)
 finally:
     if os.path.exists(DATABASE):
         print("Deleting database:{}".format(DATABASE))
