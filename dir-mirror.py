@@ -31,6 +31,8 @@ EXIT_FLAG = False
 watcher = None
 t_fs_watcher = None
 EVENT_IDLE_TIMEOUT = 20  # Minimum time to consider events to be idle.
+watcher_db = None
+comms_db = None
 
 
 def calc_hash(file_path):
@@ -53,6 +55,7 @@ def query_db(db, query, args=(), one=False):
 
 def init_database():
     global DATABASE
+    global comms_db
 
     db_dir = os.path.join(ROOT, '.dir-mirror')
     if not os.path.isdir(db_dir):
@@ -60,65 +63,43 @@ def init_database():
 
     DATABASE = os.path.join(db_dir, "database.db")
     # Create an empty database or connect to an existing one
-    db = sqlite3.connect(DATABASE)
+    comms_db = sqlite3.connect(DATABASE)
 
     try:
-        if get_event_count_from_db() > 0:
+        if get_event_count_from_db(comms_db) > 0:
             print("Clearing old events from the database.")
-            db = sqlite3.connect(DATABASE)
             sql = "DELETE FROM events"
-            db.execute(sql)
-            db.commit()
+            comms_db.execute(sql)
     except:
         # Create an event queue table
         sql = "create table events (id INTEGER PRIMARY KEY AUTOINCREMENT, ev_type TEXT, obj_type TEXT, path TEXT, " \
               "hash TEXT, time INTEGER)"
-        db.execute(sql)
-        db.commit()
+        comms_db.execute(sql)
 
         # Create a file and folder list table
         sql = "create table files (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT, obj_type TEXT, mtime INTEGER, " \
               "size INTEGER, hash TEXT, content TEXT)"
-        db.execute(sql)
-        db.commit()
+        comms_db.execute(sql)
 
         # Create a variable list table so we can store arbitrary information
         sql = "create table vars (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, value TEXT, time INTEGER)"
-        db.execute(sql)
-        db.commit()
+        comms_db.execute(sql)
 
-    db.close()
-
-
-def add_var_to_db(name, value=""):
-    db = sqlite3.connect(DATABASE)
-
-    try:
-        sql = "INSERT INTO vars (name, value, time) VALUES ('{}', '{}', '{}')".format(name, value, int(time.time()))
-        db.execute(sql)
-        db.commit()
-    except Exception as e:
-        print("ERROR writing variable to db: {}".format(e))
-
-    db.close()
+    comms_db.commit()
 
 
-def get_var_from_db(name):
+def get_var_from_db(db, name):
     sql = "SELECT * FROM vars WHERE name = '{}'".format(name)
-    db = sqlite3.connect(DATABASE)
     result = query_db(db, sql, one=True)
-    db.close()
 
     return result
 
 
-def add_event_to_db(event):
+def add_event_to_db(db, event):
     """ Adds events to database.
         event to add in format:
             {'ev_type': <CREATE or DELETE>, 'obj_type': <file or dir>, 'path': <object path relative to ROOT>}
     """
-    db = sqlite3.connect(DATABASE)
-
     try:
         sql = "INSERT INTO events (ev_type, obj_type, path, hash, time) VALUES ('{}', '{}', '{}', '{}', '{}')" \
               "".format(event['ev_type'], event['obj_type'], event['path'], event['hash'], int(time.time()))
@@ -132,21 +113,17 @@ def add_event_to_db(event):
     except Exception as e:
         print("ERROR writing events to db: {}".format(e))
 
-    db.close()
 
-
-def get_events_from_db(from_time):
+def get_events_from_db(db, from_time):
     """ Retrieves all events from database that happened after specified timestamp. """
 
     sql = "SELECT * FROM events WHERE time > '{}' ORDER BY time".format(int(from_time))
-    db = sqlite3.connect(DATABASE)
     result = query_db(db, sql)
-    db.close()
 
     return result
 
 
-def cleanup_events_from_db():
+def cleanup_events_from_db(db):
     global EVENT_LIFETIME
     global last_event_cleanup_time
 
@@ -155,54 +132,44 @@ def cleanup_events_from_db():
         oldest_acceptable_time = time.time() - EVENT_LIFETIME
 
         sql = "DELETE FROM events WHERE time < {}".format(oldest_acceptable_time)
-        db = sqlite3.connect(DATABASE)
         db.execute(sql)
         db.commit()
-        db.close()
 
         last_event_cleanup_time = time.time()
 
 
-def get_file_from_db(path):
+def get_file_from_db(db, path):
     sql = "SELECT * FROM files WHERE path='{}'".format(path)
-    db = sqlite3.connect(DATABASE)
     result = query_db(db, sql, one=True)
-    db.close()
 
     return result
 
 
-def get_file_count_from_db():
+def get_file_count_from_db(db):
     sql = "SELECT * FROM files"
-    db = sqlite3.connect(DATABASE)
     result = query_db(db, sql)
-    db.close()
 
     return len(result)
 
 
-def get_event_count_from_db():
+def get_event_count_from_db(db):
     sql = "SELECT * FROM events"
-    db = sqlite3.connect(DATABASE)
     result = query_db(db, sql)
-    db.close()
 
     return len(result)
 
 
-def get_all_files_from_db(dir_path=None):
+def get_all_files_from_db(db, dir_path=None):
     sql = "SELECT * FROM files"
     if dir_path is not None:
         sql += " WHERE path LIKE '{}'".format(dir_path)
 
-    db = sqlite3.connect(DATABASE)
     result = query_db(db, sql)
-    db.close()
 
     return result
 
 
-def update_file_in_db(path, type, mtime, size, hash):
+def update_file_in_db(db, path, type, mtime, size, hash):
     """ Adds a new or updates existing file of folder in database and updates its parent content
 
         path: <path relative to ROOT>,
@@ -211,8 +178,6 @@ def update_file_in_db(path, type, mtime, size, hash):
         size: <size in bytes if it is a file>,
         hash: <file hash if it is a file>,
     """
-    db = sqlite3.connect(DATABASE)
-
     try:
         # Add requested file
         sql = "SELECT id FROM files WHERE path='{}'".format(path)
@@ -247,23 +212,19 @@ def update_file_in_db(path, type, mtime, size, hash):
         exc_type, exc_obj, exc_tb = sys.exc_info()
         print("ERROR writing files to db on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
-    db.close()
 
-
-def add_missing_path_to_db(relative_path):
+def add_missing_path_to_db(db, relative_path):
     full_path = os.path.join(ROOT, relative_path.strip('/'))
     obj_stat = get_stat(full_path)
     if obj_stat is not None:
-        update_file_in_db(relative_path, obj_stat['obj_type'], obj_stat['mtime'], obj_stat['size'], obj_stat['hash'])
+        update_file_in_db(db, relative_path, obj_stat['obj_type'], obj_stat['mtime'], obj_stat['size'], obj_stat['hash'])
 
 
-def remove_file_from_db(path):
+def remove_file_from_db(db, path):
     """ Removes a file or folder from database and from it's parent content
 
         path is a path to the file or folder to remove
     """
-
-    db = sqlite3.connect(DATABASE)
     try:
         if path != '/':
             # Find parent dir
@@ -286,8 +247,6 @@ def remove_file_from_db(path):
     except Exception as exc:
         exc_type, exc_obj, exc_tb = sys.exc_info()
         print("ERROR removing files from db on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
-
-    db.close()
 
 
 def get_stat(file_path):
@@ -322,7 +281,7 @@ def get_stat(file_path):
     return info
 
 
-def handle_obj_add(relative_path):
+def handle_obj_add(db, relative_path):
     """ When creating objects, entire content and paths need to be noted in the file database,
         but in event database, we only need events for creating files. Directories will be created consequently.
     """
@@ -330,7 +289,7 @@ def handle_obj_add(relative_path):
     obj_stat = get_stat(full_obj_path)
 
     if obj_stat is not None:
-        update_file_in_db(relative_path, obj_stat['obj_type'], obj_stat['mtime'], obj_stat['size'], obj_stat['hash'])
+        update_file_in_db(db, relative_path, obj_stat['obj_type'], obj_stat['mtime'], obj_stat['size'], obj_stat['hash'])
 
         if obj_stat['obj_type'] == 'dir':
             # Add children to self content
@@ -340,7 +299,7 @@ def handle_obj_add(relative_path):
                 root_stat = get_stat(root)
 
                 if root_stat is not None and '.dir-mirror' not in relative_root:
-                    update_file_in_db(relative_root, root_stat['obj_type'], root_stat['mtime'], root_stat['size'], root_stat['hash'])
+                    update_file_in_db(db, relative_root, root_stat['obj_type'], root_stat['mtime'], root_stat['size'], root_stat['hash'])
 
                     # Add files
                     for f in f_names:
@@ -349,25 +308,26 @@ def handle_obj_add(relative_path):
                         file_stat = get_stat(full_path)
 
                         if file_stat is not None:
-                            update_file_in_db(relative_path, file_stat['obj_type'], file_stat['mtime'], file_stat['size'], file_stat['hash'])
+                            update_file_in_db(db, relative_path, file_stat['obj_type'], file_stat['mtime'], file_stat['size'], file_stat['hash'])
                             # Add file create event
                             event_data = {"ev_type": "CREATE", "obj_type": file_stat['obj_type'], "path": relative_path, "hash": file_stat['hash']}
-                            add_event_to_db(event_data)
+                            add_event_to_db(db, event_data)
 
         else:
             # Add file create event
             event_data = {"ev_type": "CREATE", "obj_type": obj_stat['obj_type'], "path": relative_path, "hash": obj_stat['hash']}
-            add_event_to_db(event_data)
+            add_event_to_db(db, event_data)
 
 
-def handle_obj_delete(relative_path):
+def handle_obj_delete(db, relative_path):
     # Get the dir object from db
-    obj = get_file_from_db(relative_path)
+    obj = get_file_from_db(db, relative_path)
 
     if obj is not None:
-        # When deleting a directory, we only need event for whole directory, not the children, as they will get deleted consequently.
+        # When deleting a directory, we only need event for whole directory, not the children
+        # as they will get deleted consequently.
         event_data = {"ev_type": "DELETE", "obj_type": obj['obj_type'], "path": relative_path, "hash": obj['hash']}
-        add_event_to_db(event_data)
+        add_event_to_db(db, event_data)
 
         if obj['obj_type'] == 'dir':
             obj_content = json.loads(obj['content'])
@@ -378,19 +338,19 @@ def handle_obj_delete(relative_path):
                     child_relative_path = os.path.join(relative_path, child_name.strip('/'))
 
                     # get child
-                    child = get_file_from_db(child_relative_path)
+                    child = get_file_from_db(db, child_relative_path)
 
                     if child['obj_type'] == 'dir':
-                        handle_obj_delete(child_relative_path)
+                        handle_obj_delete(db, child_relative_path)
                     else:
-                        remove_file_from_db(child_relative_path)
+                        remove_file_from_db(db, child_relative_path)
 
             except Exception as exc:
                 exc_type, exc_obj, exc_tb = sys.exc_info()
                 print("ERROR listing children on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
         # Finally delete self from database
-        remove_file_from_db(relative_path)
+        remove_file_from_db(db, relative_path)
 
 
 def check_args():
@@ -425,7 +385,7 @@ def check_args():
         sys.exit("ERROR: {}, \n\tPlease specify a port higher than 80.".format(exc))
 
 
-def parse_event(ev_type, ev_path, ev_file_name):
+def parse_event(db, ev_type, ev_path, ev_file_name):
     """ Processes file system change events received from kernel
 
         Calls handle_event function using an event object formatted as a dictionary containing:
@@ -435,7 +395,7 @@ def parse_event(ev_type, ev_path, ev_file_name):
     """
     # print("EVENT:", ev_type, ev_path, ev_file_name)
 
-    cleanup_events_from_db()
+    cleanup_events_from_db(db)
 
     obj_event_type = None
 
@@ -451,9 +411,9 @@ def parse_event(ev_type, ev_path, ev_file_name):
 
         if obj_event_type is not None:
             if obj_event_type == "DELETE":
-                handle_obj_delete(relative_path)
+                handle_obj_delete(db, relative_path)
             else:
-                handle_obj_add(relative_path)
+                handle_obj_add(db, relative_path)
 
 
 def file_system_event_watcher():
@@ -462,12 +422,14 @@ def file_system_event_watcher():
         Passes the events to parser for processing.
     """
     global EXIT_FLAG
+    global watcher_db
 
-    # while not EXIT_FLAG:
+    watcher_db = sqlite3.connect(DATABASE)
+
     try:
         for event in watcher.event_gen(yield_nones=False):
             (_, type_names, path, filename) = event
-            parse_event(type_names, path, filename)
+            parse_event(watcher_db, type_names, path, filename)
 
     except Exception as e:
         # The watcher caused an error, lost track of events. Best re-start the whole app.
@@ -475,8 +437,10 @@ def file_system_event_watcher():
         print("Watcher error.Exiting.")
         EXIT_FLAG = True
 
+    watcher_db.close()
 
-def parse_client_request(request):
+
+def parse_client_request(db, request):
     global new_file_temp_path
     global new_file_path
     global new_file_size
@@ -492,11 +456,11 @@ def parse_client_request(request):
             if 'path' in request.keys():
                 full_path = os.path.join(ROOT, request['path'].strip('/'))
                 if os.path.isfile(full_path):
-                    file_data = get_file_from_db(request['path'])
+                    file_data = get_file_from_db(db, request['path'])
                     if file_data is None:
                         # File exists but is not added to DB. Add it now.
-                        add_missing_path_to_db(request['path'])
-                        file_data = get_file_from_db(request['path'])
+                        add_missing_path_to_db(db, request['path'])
+                        file_data = get_file_from_db(db, request['path'])
 
                     response_msg = {'path': file_data['path'], 'size': file_data['size'], 'hash': file_data['hash'],
                                     'mtime': file_data['mtime']}
@@ -513,11 +477,11 @@ def parse_client_request(request):
 
                     response_data = None
                 elif os.path.isdir(full_path):
-                    response_data['response'] = get_all_files_from_db(request['path'])
+                    response_data['response'] = get_all_files_from_db(db, request['path'])
                 else:
                     response_data = {'code': "ERROR", 'response': "No such file: {}".format(request['path'])}
             else:
-                response_data['response'] = get_all_files_from_db()
+                response_data['response'] = get_all_files_from_db(db)
 
         elif request['request'] == 'update_file':
             if 'path' in request.keys() and 'obj_type' in request.keys():
@@ -529,10 +493,10 @@ def parse_client_request(request):
                     done_processing = False
                     current_mtime = 0
                     if os.path.isfile(old_file_full_path):
-                        file_data = get_file_from_db(request['path'])
+                        file_data = get_file_from_db(db, request['path'])
                         if file_data is None:
-                            add_missing_path_to_db(request['path'])
-                            file_data = get_file_from_db(request['path'])
+                            add_missing_path_to_db(db, request['path'])
+                            file_data = get_file_from_db(db, request['path'])
 
                         current_mtime = file_data['mtime']
                         if request.get('hash', '') == file_data['hash']:
@@ -569,7 +533,7 @@ def parse_client_request(request):
             else:
                 timestamp = 0
 
-            event_time_var = get_var_from_db("ev_time")
+            event_time_var = get_var_from_db(db, "ev_time")
             event_time = event_time_var.get("time", 0)
             print("event_time:", event_time)
 
@@ -578,8 +542,8 @@ def parse_client_request(request):
                 response_data['response'] = "Events in progress"
                 response_data['code'] = "ERROR"
             else:
-                response_data['response'] = json.dumps(get_events_from_db(timestamp))
-                response_data['file_count'] = get_file_count_from_db()
+                response_data['response'] = json.dumps(get_events_from_db(db, timestamp))
+                response_data['file_count'] = get_file_count_from_db(db)
 
         elif request['request'] == 'set_events':
             response_data = {'code': "ERROR", 'response': "Unknown request"}
@@ -590,12 +554,12 @@ def parse_client_request(request):
                         if event['ev_type'] == 'DELETE':
                             if 'path' in event.keys():
                                 full_path = os.path.join(ROOT, event['path'].strip('/'))
-                                file_data = get_file_from_db(event['path'])
+                                file_data = get_file_from_db(db, event['path'])
                                 if os.path.exists(full_path):
                                     if file_data is None:
                                         # File exists but is not added to DB. Add it now.
-                                        add_missing_path_to_db(request['path'])
-                                        file_data = get_file_from_db(request['path'])
+                                        add_missing_path_to_db(db, request['path'])
+                                        file_data = get_file_from_db(db, request['path'])
 
                                     do_delete_flag = True
                                     if len(file_data) > 0:
@@ -638,7 +602,7 @@ def parse_client_request(request):
         yield response
 
 
-def socket_server():
+def socket_server(db):
     """ Main server loop.
 
         Receives string data and sending to parser for processing.
@@ -689,7 +653,7 @@ def socket_server():
                                             old_file_full_path = os.path.join(ROOT, new_file_path.strip('/'))
 
                                             if os.path.isfile(old_file_full_path):
-                                                file_data = get_file_from_db(new_file_path)
+                                                file_data = get_file_from_db(db, new_file_path)
                                                 current_mtime = file_data['mtime']
                                             else:
                                                 current_mtime = 0
@@ -723,7 +687,7 @@ def socket_server():
                             try:
                                 if len(msg) > 5:
                                     request = json.loads(msg)
-                                    for answer in parse_client_request(request):
+                                    for answer in parse_client_request(db, request):
                                         try:
                                             response = answer.encode()
                                         except:
@@ -840,17 +804,17 @@ def client_fetch_remote_file(relative_path):
             os.remove(temp_path)
 
 
-def client_send_local_file(relative_path):
+def client_send_local_file(db, relative_path):
     print("client_send_local_file: ", relative_path)
 
     full_path = os.path.join(ROOT, relative_path.strip('/'))
 
     if os.path.isfile(full_path):
-        msg = get_file_from_db(relative_path)
+        msg = get_file_from_db(db, relative_path)
         if msg is None:
             # File exists but is not added to DB. Add it now.
-            add_missing_path_to_db(relative_path)
-            msg = get_file_from_db(relative_path)
+            add_missing_path_to_db(db, relative_path)
+            msg = get_file_from_db(db, relative_path)
 
         msg['request'] = 'update_file'
 
@@ -887,7 +851,7 @@ def client_send_local_file(relative_path):
             print("Not sending new file. Server says: {}".format(server_response) )
 
 
-def client_sync_remote_file(remote_file_data):
+def client_sync_remote_file(db, remote_file_data):
     print("client_sync_remote_file:", remote_file_data)
     relative_path = remote_file_data['path']
     try:
@@ -897,18 +861,18 @@ def client_sync_remote_file(remote_file_data):
             full_path = os.path.join(ROOT, relative_path.strip('/'))
             if os.path.isfile(full_path):
                 # We already have this file. Check if different, newer,...
-                file_data = get_file_from_db(relative_path)
+                file_data = get_file_from_db(db, relative_path)
                 if file_data is None:
                     # File exists but is not added to DB. Add it now.
-                    add_missing_path_to_db(relative_path)
-                    file_data = get_file_from_db(relative_path)
+                    add_missing_path_to_db(db, relative_path)
+                    file_data = get_file_from_db(db, relative_path)
 
                 if file_data['hash'] != remote_file_data['hash']:
                     remote_event_time = int(remote_file_data.get('time', 0))
 
                     if int(file_data.get('mtime', 0)) > int(remote_file_data.get('mtime', remote_event_time)):
                         # local file is newer send it
-                        client_send_local_file(relative_path)
+                        client_send_local_file(db, relative_path)
                     else:
                         # Remote file is newer. Fetch it.
                         client_fetch_remote_file(relative_path)
@@ -923,7 +887,7 @@ def client_sync_remote_file(remote_file_data):
         print("ERROR parsing file data: {}\n on line {}!\n\t{}".format(remote_file_data, exc_tb.tb_lineno, exc))
 
 
-def client_sync_local_files(remote_file_list):
+def client_sync_local_files(db, remote_file_list):
     # Check which files we have and send ones that do not exist on the remote system
     print("Sync local files. Remote files:", remote_file_list, type(remote_file_list))
     # Create a dictionary of remote files only, not dirs
@@ -941,7 +905,7 @@ def client_sync_local_files(remote_file_list):
 
     # Now that we have a list of remote files, we can list local files and check for missing
     try:
-        for loc_obj in get_all_files_from_db():
+        for loc_obj in get_all_files_from_db(db):
             if loc_obj['obj_type'] == 'file':
                 if loc_obj['path'] in remote_file_dict.keys():
                     # This file exists on the server. Check if different.
@@ -950,19 +914,19 @@ def client_sync_local_files(remote_file_list):
                         # Files are different. Check which is newer.
                         if int(loc_obj.get('mtime', 0)) > int(remote_file.get('mtime', 0)):
                             # Local file is newer
-                            client_send_local_file(loc_obj['path'])
+                            client_send_local_file(db, loc_obj['path'])
                         else:
                             # Get remote file
-                            client_sync_remote_file(loc_obj)
+                            client_sync_remote_file(db, loc_obj)
                 else:
-                    client_send_local_file(loc_obj['path'])
+                    client_send_local_file(db, loc_obj['path'])
 
     except Exception as exc:
         exc_type, exc_obj, exc_tb = sys.exc_info()
         print("ERROR parsing local file list, on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
 
-def client_handle_remote_event(remote_event):
+def client_handle_remote_event(db, remote_event):
     # print("client_handle_remote_event. Remote event: ", remote_event)
     try:
         full_path = os.path.join(ROOT, remote_event['path'].strip('/'))
@@ -971,7 +935,7 @@ def client_handle_remote_event(remote_event):
             print("client_handle_CREATE_event: ", remote_event)
             if remote_event['obj_type'] == 'file':
                 print("handle_CREATE_file: ", full_path)
-                client_sync_remote_file(remote_event)
+                client_sync_remote_file(db, remote_event)
 
         elif remote_event['ev_type'] == 'DELETE':
             if os.path.exists(full_path):
@@ -986,7 +950,7 @@ def client_handle_remote_event(remote_event):
         print("ERROR parsing remote event on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
 
-def client_handle_local_event(local_event):
+def client_handle_local_event(db, local_event):
     # Only send DELETE events as event. CREATE file events send as update_file request
     print("client_handle_local_event:", local_event)
 
@@ -994,7 +958,7 @@ def client_handle_local_event(local_event):
         if local_event['ev_type'] == 'CREATE':
             # only send created files. Directories will be created consequently.
             if local_event['obj_type'] == 'file':
-                client_send_local_file(local_event['path'])
+                client_send_local_file(db, local_event['path'])
 
         elif local_event['ev_type'] == 'DELETE':
             msg = {'request': 'set_events', 'events': [local_event]}
@@ -1018,7 +982,7 @@ def client_handle_local_event(local_event):
         print("ERROR handling local event on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
 
 
-def socket_client():
+def socket_client(db):
     """ Main client loop.
 
         Periodically asks remote server for new events and sends local events to server.
@@ -1035,25 +999,26 @@ def socket_client():
     if 'response' in response.keys():
         try:
             for remote_file_data in response['response']:
-                client_sync_remote_file(remote_file_data)
+                client_sync_remote_file(db, remote_file_data)
 
             last_local_event_time = time.time()
-            client_sync_local_files(response['response'])
+            client_sync_local_files(db, response['response'])
 
             while True:
                 time.sleep(1)
 
                 # Check local events
-                local_events = get_events_from_db(last_local_event_time)
+                local_events = get_events_from_db(db, last_local_event_time)
 
                 if len(local_events) > 0:
                     # New events occurred. Sync more often.
                     client_sync_timeout = 10
 
                     for event in local_events:
-                        client_handle_local_event(event)
+                        client_handle_local_event(db, event)
                         if event['time'] >= last_local_event_time:
                             last_local_event_time = event['time']
+
 
                 if (time.time() - last_sync_time) > client_sync_timeout:
                     # Check remote events.
@@ -1067,15 +1032,19 @@ def socket_client():
                         try:
                             event_list = json.loads(response['response'])
                             if isinstance(event_list, list) and len(event_list) > 0:
-                                client_sync_timeout = 1
+                                client_sync_timeout = 10
                                 for event in event_list:
-                                    client_handle_remote_event(event)
+                                    client_handle_remote_event(db, event)
 
                                     if event['time'] > last_remote_event_time:
                                         last_remote_event_time = event['time']
+                            else:
+                                # No new events. Can delay longer
+                                if client_sync_timeout < MAX_CLIENT_SYNC_TIMEOUT:
+                                    client_sync_timeout += 2
 
                             server_file_count = response.get('file_count', 0)
-                            local_file_count = get_file_count_from_db()
+                            local_file_count = get_file_count_from_db(db)
                             if local_file_count != server_file_count:
                                 # The server and client are not in sync. Perform full sync.
                                 print("ERROR in sync. Server file count: {}; local file count: {}".format(server_file_count, local_file_count))
@@ -1084,12 +1053,15 @@ def socket_client():
 
                                 if 'response' in response.keys():
                                     for remote_file_data in response['response']:
-                                        client_sync_remote_file(remote_file_data)
-                                    client_sync_local_files(response['response'])
+                                        client_sync_remote_file(db, remote_file_data)
+                                    client_sync_local_files(db, response['response'])
 
                         except Exception as exc:
                             exc_type, exc_obj, exc_tb = sys.exc_info()
                             print("ERROR parsing remote event list on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
+                    else:
+                        # Events in progress. Need to check more often.
+                        client_sync_timeout = 10
 
         except Exception as exc:
             exc_type, exc_obj, exc_tb = sys.exc_info()
@@ -1102,10 +1074,11 @@ def init_file_system_watcher():
     global EXIT_FLAG
     global watcher
     global t_fs_watcher
+    global comms_db
 
     print("Building file list. Please wait.")
     start_time = time.time()
-    handle_obj_add("/")
+    handle_obj_add(comms_db, "/")
     print("Finished adding files to database in {} seconds.".format(int(time.time() - start_time)))
 
     print("Watching {}".format(ROOT))
@@ -1142,9 +1115,9 @@ try:
             init_database()
             init_file_system_watcher()
             if MODE == 'server':
-                socket_server()
+                socket_server(comms_db)
             else:
-                socket_client()
+                socket_client(comms_db)
         except Exception as exc:
             exc_type, exc_obj, exc_tb = sys.exc_info()
             print("ERROR initializing on line {}!\n\t{}".format(exc_tb.tb_lineno, exc))
@@ -1153,4 +1126,5 @@ try:
 finally:
     if os.path.exists(DATABASE):
         print("Deleting database:{}".format(DATABASE))
+        comms_db.close()
         os.remove(DATABASE)
